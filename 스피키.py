@@ -325,6 +325,80 @@ async def leave(interaction: discord.Interaction):
 
     await interaction.followup.send("응.")
 
+# ==============================
+# ✅ 추가 기능 1: 대기열 목록 보기 (/목록)
+# ==============================
+@bot.tree.command(name="목록", description="현재 예약(대기열)된 노래 목록 확인")
+async def queue_list(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    if not interaction.guild:
+        await interaction.followup.send("길드(서버)에서만 사용할 수 있습니다.")
+        return
+
+    music = get_music(interaction.guild.id)
+    touch_command(music)
+    music.last_text_channel_id = interaction.channel_id
+    ensure_idle_task(interaction.guild, music)
+
+    async with music.lock:
+        if not music.queue:
+            await interaction.followup.send("대기열이 비어있어.")
+            return
+
+        items = list(music.queue)[:20]
+        lines = []
+        for i, t in enumerate(items, start=1):
+            lines.append(f"{i}. **{t.title}**\n{t.url}")
+
+        more = len(music.queue) - len(items)
+        if more > 0:
+            lines.append(f"...그리고 {more}개 더 있어.")
+
+        msg = "📃 대기열 목록\n" + "\n\n".join(lines)
+
+    await interaction.followup.send(msg)
+
+# ==============================
+# ✅ 추가 기능 2: 대기열 예약 취소 (/취소 번호)
+# ==============================
+@bot.tree.command(name="취소", description="대기열에서 특정 번호의 곡을 삭제(예약 취소)")
+@app_commands.describe(번호="목록에서 보이는 번호(1부터)")
+async def queue_remove(interaction: discord.Interaction, 번호: int):
+    await interaction.response.defer(thinking=True)
+
+    if not interaction.guild:
+        await interaction.followup.send("길드(서버)에서만 사용할 수 있습니다.")
+        return
+
+    if 번호 <= 0:
+        await interaction.followup.send("그 번호는 없어.")
+        return
+
+    music = get_music(interaction.guild.id)
+    touch_command(music)
+    music.last_text_channel_id = interaction.channel_id
+    ensure_idle_task(interaction.guild, music)
+
+    removed: Optional[Track] = None
+
+    async with music.lock:
+        if not music.queue:
+            await interaction.followup.send("대기열이 비어있어.")
+            return
+
+        if 번호 > len(music.queue):
+            await interaction.followup.send("그 번호는 없어.")
+            return
+
+        # deque에서 특정 인덱스 삭제: 안전하게 clear/extend로 갱신 (참조 유지)
+        q_list = list(music.queue)
+        removed = q_list.pop(번호 - 1)
+        music.queue.clear()
+        music.queue.extend(q_list)
+
+    await interaction.followup.send(f"✅ 취소됨: **{removed.title}**")
+
 if __name__ == "__main__":
     TOKEN = os.getenv("TOKEN")
     if not TOKEN:
