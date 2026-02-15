@@ -10,6 +10,8 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 
+print("BOOT: 스피키.py 실행됨")
+
 # ==============================
 # 설정
 # ==============================
@@ -410,3 +412,4 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
