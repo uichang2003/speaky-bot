@@ -1,4 +1,3 @@
-ARG CACHE_BUST=1
 discord.py
 yt-dlp
 PyNaCl
