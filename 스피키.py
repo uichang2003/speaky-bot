@@ -92,8 +92,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
-    print(f"Logged in as {bot.user}")
+    # ✅ 여기에서 "동기화 성공 여부 + 등록된 슬래시 커맨드 개수"를 로그로 확인합니다.
+    try:
+        cmds = await bot.tree.sync()
+        print(f"Logged in as {bot.user}")
+        print(f"SYNC_OK: {len(cmds)} commands")
+    except Exception as e:
+        print(f"Logged in as {bot.user}")
+        print("SYNC_FAIL:", repr(e))
 
 async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient:
     """
