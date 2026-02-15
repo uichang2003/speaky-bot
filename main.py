@@ -1,6 +1,7 @@
 import os
 import asyncio
 import time
+import logging
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, Optional
@@ -10,12 +11,23 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 
-print("BOOT: 스피키.py 실행됨")
+# ==============================
+# ✅ 부팅/동기화 로그(확정 출력)
+# ==============================
+logging.basicConfig(level=logging.INFO)
+bootlog = logging.getLogger("boot")
+
+print("BOOT: main.py 실행됨", flush=True)
 
 # ==============================
 # 설정
 # ==============================
 IDLE_TIMEOUT_SEC = 5 * 60  # ✅ 퇴장 시간(초)
+
+# ✅ 서버(길드) 동기화로 커맨드를 즉시 보이게 할 서버 ID
+# - 디스코드 개발자 모드 ON
+# - 서버 우클릭 → 서버 ID 복사
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # Railway Variables에 GUILD_ID 추가 추천
 
 # ==============================
 # yt-dlp 설정
@@ -36,12 +48,14 @@ FFMPEG_OPTIONS = {
     "options": "-vn -ar 48000 -ac 2",
 }
 
+
 @dataclass
 class Track:
     title: str
     url: str
     stream_url: str
     requester: int
+
 
 class GuildMusic:
     def __init__(self):
@@ -58,16 +72,20 @@ class GuildMusic:
         # ✅ 마지막으로 명령을 친 텍스트 채널(멘트 출력용)
         self.last_text_channel_id: Optional[int] = None
 
+
 music_data: Dict[int, GuildMusic] = {}
+
 
 def get_music(guild_id: int) -> GuildMusic:
     if guild_id not in music_data:
         music_data[guild_id] = GuildMusic()
     return music_data[guild_id]
 
+
 def touch_command(music: GuildMusic):
     """명령이 들어올 때마다 호출해서 타이머 리셋"""
     music.last_command_ts = time.monotonic()
+
 
 def extract_info(제목: str) -> Track:
     """
@@ -89,19 +107,29 @@ def extract_info(제목: str) -> Track:
 
     return Track(title=title, url=webpage_url, stream_url=stream_url, requester=0)
 
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+
 @bot.event
 async def on_ready():
-    # ✅ 여기에서 "동기화 성공 여부 + 등록된 슬래시 커맨드 개수"를 로그로 확인합니다.
+    bootlog.info("READY_HIT: %s", bot.user)
+
+    # ✅ 길드 ID를 넣었다면 길드 sync(즉시 반영), 아니면 전역 sync(반영 지연 가능)
     try:
-        cmds = await bot.tree.sync()
-        print(f"Logged in as {bot.user}")
-        print(f"SYNC_OK: {len(cmds)} commands")
+        if GUILD_ID and GUILD_ID != 0:
+            guild = discord.Object(id=GUILD_ID)
+            cmds = await asyncio.wait_for(bot.tree.sync(guild=guild), timeout=30)
+            bootlog.info("SYNC_OK(GUILD): %d commands", len(cmds))
+        else:
+            cmds = await asyncio.wait_for(bot.tree.sync(), timeout=30)
+            bootlog.info("SYNC_OK(GLOBAL): %d commands", len(cmds))
+    except asyncio.TimeoutError:
+        bootlog.warning("SYNC_TIMEOUT: 30초 내 끝나지 않음")
     except Exception as e:
-        print(f"Logged in as {bot.user}")
-        print("SYNC_FAIL:", repr(e))
+        bootlog.exception("SYNC_FAIL: %r", e)
+
 
 async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient:
     """
@@ -127,6 +155,7 @@ async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient
 
     return await channel.connect()
 
+
 async def _send_idle_message_only_last_channel(guild: discord.Guild, music: GuildMusic, message: str):
     """
     ✅ 마지막 명령 채널에만 전송 시도.
@@ -143,7 +172,8 @@ async def _send_idle_message_only_last_channel(guild: discord.Guild, music: Guil
         if hasattr(ch, "send"):
             await ch.send(message)
     except Exception as e:
-        print("자동퇴장 멘트 전송 실패:", repr(e))
+        print("자동퇴장 멘트 전송 실패:", repr(e), flush=True)
+
 
 async def idle_watcher(guild: discord.Guild, music: GuildMusic):
     """
@@ -196,6 +226,7 @@ async def idle_watcher(guild: discord.Guild, music: GuildMusic):
     except asyncio.CancelledError:
         return
 
+
 def ensure_idle_task(guild: discord.Guild, music: GuildMusic):
     """
     ✅ 기존 idle_task가 있으면 유지하고, 없으면 생성
@@ -203,6 +234,7 @@ def ensure_idle_task(guild: discord.Guild, music: GuildMusic):
     if music.idle_task and not music.idle_task.done():
         return
     music.idle_task = asyncio.create_task(idle_watcher(guild, music))
+
 
 async def player_loop(guild: discord.Guild, music: GuildMusic):
     while True:
@@ -230,14 +262,14 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
 
         def after_play(error):
             if error:
-                print("재생 after 에러:", repr(error))
+                print("재생 after 에러:", repr(error), flush=True)
             bot.loop.call_soon_threadsafe(music.next_event.set)
 
         try:
             vc.play(source, after=after_play)
-            print(f"[재생 시작] {track.title}")
+            print(f"[재생 시작] {track.title}", flush=True)
         except Exception as e:
-            print("vc.play 에러:", repr(e))
+            print("vc.play 에러:", repr(e), flush=True)
             bot.loop.call_soon_threadsafe(music.next_event.set)
             continue
 
@@ -248,6 +280,7 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
         async with music.lock:
             if not music.queue:
                 touch_command(music)
+
 
 @bot.tree.command(name="재생", description="유튜브 URL 또는 제목으로 음악 재생(대기열 추가)")
 @app_commands.describe(제목="URL 또는 제목 입력")
@@ -279,6 +312,7 @@ async def play(interaction: discord.Interaction, 제목: str):
     except Exception as e:
         await interaction.followup.send(f"오류: {type(e).__name__}: {e}")
 
+
 @bot.tree.command(name="스킵", description="현재 곡만 스킵하고 다음 곡 재생")
 async def skip(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
@@ -299,6 +333,7 @@ async def skip(interaction: discord.Interaction):
 
     vc.stop()
     await interaction.followup.send("⏭️ 다음꺼야.")
+
 
 @bot.tree.command(name="나가", description="음악 종료 + 대기열 비움 + 봇 퇴장")
 async def leave(interaction: discord.Interaction):
@@ -333,6 +368,7 @@ async def leave(interaction: discord.Interaction):
 
     await interaction.followup.send("응.")
 
+
 # ==============================
 # ✅ 추가 기능 1: 대기열 목록 보기 (/목록)
 # ==============================
@@ -366,6 +402,7 @@ async def queue_list(interaction: discord.Interaction):
         msg = "📃 대기열 목록\n" + "\n\n".join(lines)
 
     await interaction.followup.send(msg)
+
 
 # ==============================
 # ✅ 추가 기능 2: 대기열 예약 취소 (/취소 번호)
@@ -407,9 +444,9 @@ async def queue_remove(interaction: discord.Interaction, 번호: int):
 
     await interaction.followup.send(f"✅ 취소됨: **{removed.title}**")
 
+
 if __name__ == "__main__":
     TOKEN = os.getenv("TOKEN")
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
-
