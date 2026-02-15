@@ -1,3 +1,4 @@
+ARG CACHE_BUST=
 FROM python:3.12-slim
 
 RUN apt-get update \
