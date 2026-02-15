@@ -393,7 +393,7 @@ async def queue_list(interaction: discord.Interaction):
         items = list(music.queue)[:20]
         lines = []
         for i, t in enumerate(items, start=1):
-            lines.append(f"{i}. **{t.title}**\n{t.url}")
+            lines.append(f"{i}. **{t.title}**")
 
         more = len(music.queue) - len(items)
         if more > 0:
@@ -450,3 +450,4 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
