@@ -156,7 +156,9 @@ async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient
     return await channel.connect()
 
 
-async def _send_idle_message_only_last_channel(guild: discord.Guild, music: GuildMusic, message: str):
+async def _send_idle_message_only_last_channel(
+    guild: discord.Guild, music: GuildMusic, message: str
+):
     """
     ✅ 마지막 명령 채널에만 전송 시도.
     - 실패해도 다른 채널로 보내지 않음(원하신 동작).
@@ -172,7 +174,7 @@ async def _send_idle_message_only_last_channel(guild: discord.Guild, music: Guil
         if hasattr(ch, "send"):
             await ch.send(message)
     except Exception as e:
-        print("자동퇴장 멘트 전송 실패:", repr(e), flush=True)
+        print("자동 멘트 전송 실패:", repr(e), flush=True)
 
 
 async def idle_watcher(guild: discord.Guild, music: GuildMusic):
@@ -211,7 +213,7 @@ async def idle_watcher(guild: discord.Guild, music: GuildMusic):
             if vc.is_playing() or vc.is_paused():
                 vc.stop()
 
-            # ✅ 봇 멘트는 그대로 유지
+            # ✅ 봇 멘트
             await _send_idle_message_only_last_channel(guild, music, "⏳ 5분지났어.")
 
             try:
@@ -244,12 +246,14 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
             if not music.queue:
                 music.now_playing = None
 
+        # 큐에 곡이 들어올 때까지 대기
         while True:
             async with music.lock:
                 if music.queue:
                     break
             await asyncio.sleep(0.5)
 
+        # 곡 꺼내기
         async with music.lock:
             track = music.queue.popleft()
             music.now_playing = track
@@ -268,6 +272,15 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
         try:
             vc.play(source, after=after_play)
             print(f"[재생 시작] {track.title}", flush=True)
+
+            # ✅ 핵심: 재생 시작 시 "마지막 명령 채널"에 현재곡 출력
+            requester_mention = f"<@{track.requester}>" if track.requester else "알 수 없음"
+            await _send_idle_message_only_last_channel(
+                guild,
+                music,
+                f"▶️ 현재 재생중인 곡 : {track.title} (요청자: {requester_mention})\n{track.url}",
+            )
+
         except Exception as e:
             print("vc.play 에러:", repr(e), flush=True)
             bot.loop.call_soon_threadsafe(music.next_event.set)
@@ -275,7 +288,7 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
 
         await music.next_event.wait()
 
-        # ✅ (핵심) "마지막 곡이 끝난 뒤"부터 5분을 세고 싶으므로,
+        # ✅ "마지막 곡이 끝난 뒤"부터 5분을 세고 싶으므로,
         # 큐가 비어있다면 지금 시각을 타이머 기준으로 갱신
         async with music.lock:
             if not music.queue:
@@ -450,4 +463,3 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
-
