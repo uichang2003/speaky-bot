@@ -78,10 +78,6 @@ def prepare_cookiefile() -> Optional[str]:
         return None
 
 
-COOKIEFILE = prepare_cookiefile()
-if COOKIEFILE:
-    YTDLP_OPTIONS["cookiefile"] = COOKIEFILE
-
 # ==============================
 # FFmpeg 설정
 # ==============================
@@ -748,5 +744,6 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
 
 
