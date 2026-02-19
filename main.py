@@ -206,7 +206,7 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
 
     embed.add_field(
         name="",
-        value=f"상태: {status} | 요청자: {requester_name} | 통화방: {channel_name}",
+        value=f"상태: {status} | 요청자: {requester_name} | 음성 채널: {channel_name}",
         inline=False,
     )
 
@@ -771,4 +771,5 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
 
