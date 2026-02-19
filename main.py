@@ -12,37 +12,46 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 
+# ==============================
+# ✅ 부팅/동기화 로그(확정 출력)
+# ==============================
 logging.basicConfig(level=logging.INFO)
 bootlog = logging.getLogger("boot")
 
 print("BOOT: main.py 실행됨", flush=True)
 
-IDLE_TIMEOUT_SEC = 5 * 60
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+# ==============================
+# 설정
+# ==============================
+IDLE_TIMEOUT_SEC = 5 * 60  # ✅ 퇴장 시간(초)
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # Railway Variables에 GUILD_ID 추가 추천
 
 # ==============================
 # yt-dlp 설정
 # ==============================
 YTDLP_OPTIONS = {
-    "format": "bestaudio/best",
+    "format": "bestaudio[abr>=160]/bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
-    "js_runtimes": "deno",
 
-    # 요청 완화 + 재시도
+    # ✅ 간헐 차단 완화(선택이지만 추천)
     "sleep_requests": 1,
     "sleep_interval": 1,
     "max_sleep_interval": 3,
     "retries": 3,
     "fragment_retries": 3,
+
+    # ❌ js_runtimes는 문자열로 넣으면 ValueError 발생 가능 → 제거
+    # deno는 Dockerfile에 설치되어 있으면 보통 자동으로 사용됩니다.
 }
 
-# ==============================
-# 🔥 쿠키 복원 로직 (Railway Secret 사용)
-# ==============================
 def prepare_cookiefile() -> Optional[str]:
+    """
+    입력: 환경변수 YOUTUBE_COOKIES_B64 (cookies.txt를 base64 인코딩한 문자열)
+    출력: /tmp/cookies.txt 경로 (없으면 None)
+    """
     b64 = os.getenv("YOUTUBE_COOKIES_B64")
     if not b64:
         print("쿠키 환경변수 없음", flush=True)
@@ -53,20 +62,18 @@ def prepare_cookiefile() -> Optional[str]:
         data = base64.b64decode(b64.encode("utf-8"))
         with open(path, "wb") as f:
             f.write(data)
-
         print("쿠키 적용 성공: /tmp/cookies.txt", flush=True)
         return path
     except Exception as e:
         print("쿠키 복원 실패:", repr(e), flush=True)
         return None
 
-
 COOKIEFILE = prepare_cookiefile()
 if COOKIEFILE:
     YTDLP_OPTIONS["cookiefile"] = COOKIEFILE
 
 # ==============================
-# FFmpeg 설정
+# FFmpeg 설정: 48kHz + 스테레오 고정만
 # ==============================
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -87,8 +94,12 @@ class GuildMusic:
         self.lock = asyncio.Lock()
         self.next_event = asyncio.Event()
         self.player_task: Optional[asyncio.Task] = None
+
+        # 무활동(명령 없음) 자동 퇴장용
         self.last_command_ts: float = time.monotonic()
         self.idle_task: Optional[asyncio.Task] = None
+
+        # ✅ 마지막으로 명령을 친 텍스트 채널(멘트 출력용)
         self.last_text_channel_id: Optional[int] = None
 
 music_data: Dict[int, GuildMusic] = {}
@@ -99,23 +110,35 @@ def get_music(guild_id: int) -> GuildMusic:
     return music_data[guild_id]
 
 def touch_command(music: GuildMusic):
+    """명령이 들어올 때마다 호출해서 타이머 리셋"""
     music.last_command_ts = time.monotonic()
 
-def extract_info(query: str) -> Track:
+def extract_info(제목: str) -> Track:
+    """
+    입력: 제목 (유튜브 URL 또는 제목)
+    출력: Track(title, url, stream_url, requester)
+    """
     with yt_dlp.YoutubeDL(YTDLP_OPTIONS) as ydl:
-        info = ydl.extract_info(query, download=False)
+        info = ydl.extract_info(제목, download=False)
 
     if "entries" in info and info["entries"]:
         info = info["entries"][0]
 
-    return Track(
-        title=info.get("title", "Unknown"),
-        url=info.get("webpage_url", query),
-        stream_url=info.get("url"),
-        requester=0,
-    )
+    title = info.get("title", "Unknown Title")
+    webpage_url = info.get("webpage_url", 제목)
+
+    stream_url = info.get("url")
+    if not stream_url:
+        raise Exception("스트림 URL을 가져오지 못했습니다.")
+
+    return Track(title=title, url=webpage_url, stream_url=stream_url, requester=0)
 
 async def extract_with_retry(query: str) -> Track:
+    """
+    입력: query(제목/URL)
+    출력: Track
+    - 간헐 오류 대비: 1회 재시도
+    """
     try:
         return await asyncio.to_thread(extract_info, query)
     except Exception:
@@ -125,40 +148,320 @@ async def extract_with_retry(query: str) -> Track:
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-@bot.tree.command(name="재생")
+@bot.event
+async def on_ready():
+    bootlog.info("READY_HIT: %s", bot.user)
+
+    try:
+        if GUILD_ID and GUILD_ID != 0:
+            guild = discord.Object(id=GUILD_ID)
+            cmds = await asyncio.wait_for(bot.tree.sync(guild=guild), timeout=30)
+            bootlog.info("SYNC_OK(GUILD): %d commands", len(cmds))
+        else:
+            cmds = await asyncio.wait_for(bot.tree.sync(), timeout=30)
+            bootlog.info("SYNC_OK(GLOBAL): %d commands", len(cmds))
+    except asyncio.TimeoutError:
+        bootlog.warning("SYNC_TIMEOUT: 30초 내 끝나지 않음")
+    except Exception as e:
+        bootlog.exception("SYNC_FAIL: %r", e)
+
+async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient:
+    """
+    입력: interaction
+    출력: VoiceClient
+    """
+    if not interaction.guild:
+        raise Exception("길드(서버)에서만 사용할 수 있습니다.")
+
+    if not interaction.user or not isinstance(interaction.user, discord.Member):
+        raise Exception("사용자 정보를 가져오지 못했습니다.")
+
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        raise Exception("음성채널 먼저 들어가.")
+
+    channel = interaction.user.voice.channel
+    vc = interaction.guild.voice_client
+
+    if vc and vc.is_connected():
+        if vc.channel and vc.channel.id != channel.id:
+            raise Exception("다른곳에서 날 사용중이야.")
+        return vc
+
+    return await channel.connect()
+
+async def _send_idle_message_only_last_channel(guild: discord.Guild, music: GuildMusic, message: str):
+    """
+    ✅ 마지막 명령 채널에만 전송 시도.
+    - 실패해도 다른 채널로 보내지 않음
+    """
+    if not music.last_text_channel_id:
+        return
+
+    try:
+        ch = guild.get_channel(music.last_text_channel_id)
+        if ch is None:
+            ch = await guild.fetch_channel(music.last_text_channel_id)
+
+        if hasattr(ch, "send"):
+            await ch.send(message)
+    except Exception as e:
+        print("자동 멘트 전송 실패:", repr(e), flush=True)
+
+async def idle_watcher(guild: discord.Guild, music: GuildMusic):
+    """
+    ✅ 재생중/일시정지/큐 존재 시 퇴장 금지
+    ✅ '재생도 없고 + 큐도 비어있는' 유휴 상태에서만 5분 무명령이면 퇴장
+    """
+    try:
+        while True:
+            await asyncio.sleep(2)
+
+            vc = guild.voice_client
+            if not vc or not vc.is_connected():
+                return
+
+            if vc.is_playing() or vc.is_paused():
+                continue
+
+            async with music.lock:
+                has_queue = bool(music.queue)
+
+            if has_queue:
+                continue
+
+            elapsed = time.monotonic() - music.last_command_ts
+            if elapsed < IDLE_TIMEOUT_SEC:
+                continue
+
+            async with music.lock:
+                music.queue.clear()
+                music.now_playing = None
+
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+
+            await _send_idle_message_only_last_channel(guild, music, "⏳ 5분지났어.")
+
+            try:
+                await vc.disconnect()
+            except:
+                pass
+
+            if music.player_task and not music.player_task.done():
+                music.player_task.cancel()
+
+            return
+    except asyncio.CancelledError:
+        return
+
+def ensure_idle_task(guild: discord.Guild, music: GuildMusic):
+    if music.idle_task and not music.idle_task.done():
+        return
+    music.idle_task = asyncio.create_task(idle_watcher(guild, music))
+
+async def player_loop(guild: discord.Guild, music: GuildMusic):
+    while True:
+        music.next_event.clear()
+
+        async with music.lock:
+            if not music.queue:
+                music.now_playing = None
+
+        while True:
+            async with music.lock:
+                if music.queue:
+                    break
+            await asyncio.sleep(0.5)
+
+        async with music.lock:
+            track = music.queue.popleft()
+            music.now_playing = track
+
+        vc = guild.voice_client
+        if not vc or not vc.is_connected():
+            return
+
+        source = discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS)
+
+        def after_play(error):
+            if error:
+                print("재생 after 에러:", repr(error), flush=True)
+            bot.loop.call_soon_threadsafe(music.next_event.set)
+
+        try:
+            vc.play(source, after=after_play)
+            print(f"[재생 시작] {track.title}", flush=True)
+
+            # ✅ 재생 시작 시 현재곡 출력(요청하신 형식)
+            requester_mention = f"<@{track.requester}>" if track.requester else "알 수 없음"
+            await _send_idle_message_only_last_channel(
+                guild,
+                music,
+                f"▶️ 현재 재생중인 곡 : {track.title} (요청자: {requester_mention})\n{track.url}",
+            )
+
+        except Exception as e:
+            print("vc.play 에러:", repr(e), flush=True)
+            bot.loop.call_soon_threadsafe(music.next_event.set)
+            continue
+
+        await music.next_event.wait()
+
+        async with music.lock:
+            if not music.queue:
+                touch_command(music)
+
+@bot.tree.command(name="재생", description="유튜브 URL 또는 제목으로 음악 재생(대기열 추가)")
 @app_commands.describe(제목="URL 또는 제목 입력")
 async def play(interaction: discord.Interaction, 제목: str):
     await interaction.response.defer(thinking=True)
 
     try:
-        if not interaction.user.voice:
-            await interaction.followup.send("음성채널 먼저 들어가.")
-            return
-
-        vc = interaction.guild.voice_client
-        if not vc:
-            vc = await interaction.user.voice.channel.connect()
-
+        await connect_voice(interaction)
         music = get_music(interaction.guild.id)
+
         touch_command(music)
         music.last_text_channel_id = interaction.channel_id
+        ensure_idle_task(interaction.guild, music)
 
         track = await extract_with_retry(제목)
         track.requester = interaction.user.id
 
-        source = discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS)
+        async with music.lock:
+            music.queue.append(track)
+            position = len(music.queue)
 
-        vc.play(source)
+        if not music.player_task or music.player_task.done():
+            music.player_task = asyncio.create_task(player_loop(interaction.guild, music))
 
         await interaction.followup.send(
-            f"▶️ 현재 재생중인 곡 : {track.title} (요청자: <@{track.requester}>)\n{track.url}"
+            f"🎵 **{track.title}** 대기열 추가 (위치: {position})\n{track.url}"
         )
 
     except Exception as e:
         await interaction.followup.send(f"오류: {type(e).__name__}: {e}")
 
+@bot.tree.command(name="스킵", description="현재 곡만 스킵하고 다음 곡 재생")
+async def skip(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    vc = interaction.guild.voice_client if interaction.guild else None
+    if not vc or not vc.is_connected():
+        await interaction.followup.send("음성 채널에 없어.")
+        return
+
+    music = get_music(interaction.guild.id)
+    touch_command(music)
+    music.last_text_channel_id = interaction.channel_id
+    ensure_idle_task(interaction.guild, music)
+
+    if not (vc.is_playing() or vc.is_paused()):
+        await interaction.followup.send("재생중인 음악이 없어.")
+        return
+
+    vc.stop()
+    await interaction.followup.send("⏭️ 다음꺼야.")
+
+@bot.tree.command(name="나가", description="음악 종료 + 대기열 비움 + 봇 퇴장")
+async def leave(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    if not interaction.guild:
+        await interaction.followup.send("길드(서버)에서만 사용할 수 있습니다.")
+        return
+
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected():
+        await interaction.followup.send("채널부터 들어가.")
+        return
+
+    music = get_music(interaction.guild.id)
+    touch_command(music)
+    music.last_text_channel_id = interaction.channel_id
+
+    async with music.lock:
+        music.queue.clear()
+        music.now_playing = None
+
+    if vc.is_playing() or vc.is_paused():
+        vc.stop()
+
+    await vc.disconnect()
+
+    if music.player_task and not music.player_task.done():
+        music.player_task.cancel()
+    if music.idle_task and not music.idle_task.done():
+        music.idle_task.cancel()
+
+    await interaction.followup.send("응.")
+
+@bot.tree.command(name="목록", description="현재 예약(대기열)된 노래 목록 확인")
+async def queue_list(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+
+    if not interaction.guild:
+        await interaction.followup.send("길드(서버)에서만 사용할 수 있습니다.")
+        return
+
+    music = get_music(interaction.guild.id)
+    touch_command(music)
+    music.last_text_channel_id = interaction.channel_id
+    ensure_idle_task(interaction.guild, music)
+
+    async with music.lock:
+        if not music.queue:
+            await interaction.followup.send("대기열이 비어있어.")
+            return
+
+        items = list(music.queue)[:20]
+        lines = []
+        for i, t in enumerate(items, start=1):
+            lines.append(f"{i}. **{t.title}**")
+
+        more = len(music.queue) - len(items)
+        if more > 0:
+            lines.append(f"...그리고 {more}개 더 있어.")
+
+        msg = "📃 대기열 목록\n" + "\n\n".join(lines)
+
+    await interaction.followup.send(msg)
+
+@bot.tree.command(name="취소", description="대기열에서 특정 번호의 곡을 삭제(예약 취소)")
+@app_commands.describe(번호="목록에서 보이는 번호(1부터)")
+async def queue_remove(interaction: discord.Interaction, 번호: int):
+    await interaction.response.defer(thinking=True)
+
+    if not interaction.guild:
+        await interaction.followup.send("길드(서버)에서만 사용할 수 있습니다.")
+        return
+
+    if 번호 <= 0:
+        await interaction.followup.send("그 번호는 없어.")
+        return
+
+    music = get_music(interaction.guild.id)
+    touch_command(music)
+    music.last_text_channel_id = interaction.channel_id
+    ensure_idle_task(interaction.guild, music)
+
+    async with music.lock:
+        if not music.queue:
+            await interaction.followup.send("대기열이 비어있어.")
+            return
+
+        if 번호 > len(music.queue):
+            await interaction.followup.send("그 번호는 없어.")
+            return
+
+        q_list = list(music.queue)
+        removed = q_list.pop(번호 - 1)
+        music.queue.clear()
+        music.queue.extend(q_list)
+
+    await interaction.followup.send(f"✅ 취소됨: **{removed.title}**")
+
 if __name__ == "__main__":
     TOKEN = os.getenv("TOKEN")
     if not TOKEN:
-        raise RuntimeError("TOKEN 없음")
+        raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
