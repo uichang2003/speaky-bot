@@ -36,16 +36,19 @@ YTDLP_OPTIONS = {
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
 
-    # ✅ 간헐 차단 완화(선택이지만 추천)
+    # ✅ 간헐 차단 완화
     "sleep_requests": 1,
     "sleep_interval": 1,
     "max_sleep_interval": 3,
     "retries": 3,
     "fragment_retries": 3,
 
-    # ❌ js_runtimes는 문자열로 넣으면 ValueError 발생 가능 → 제거
-    # deno는 Dockerfile에 설치되어 있으면 보통 자동으로 사용됩니다.
+    # 🔥 User-Agent 추가 (브라우저처럼 보이게)
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    },
 }
+
 
 def prepare_cookiefile() -> Optional[str]:
     """
@@ -465,3 +468,4 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
