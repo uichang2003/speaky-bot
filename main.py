@@ -303,12 +303,15 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
             print(f"[재생 시작] {track.title}", flush=True)
 
             # ✅ 재생 시작 시 현재곡 출력(요청하신 형식)
-            requester_mention = f"<@{track.requester}>" if track.requester else "알 수 없음"
+            member = guild.get_member(track.requester)
+            requester_name = member.display_name if member else "알 수 없음"
+
             await _send_idle_message_only_last_channel(
                 guild,
                 music,
-                f"▶️ 현재 재생중인 곡 : {track.title} (요청자: {requester_mention})\n{track.url}",
+                f"▶️ 현재 재생중인 곡 : {track.title} (요청자: {requester_name})\n{track.url}",
             )
+
 
         except Exception as e:
             print("vc.play 에러:", repr(e), flush=True)
@@ -475,5 +478,6 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
 
 
