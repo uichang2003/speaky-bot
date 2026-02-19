@@ -100,6 +100,9 @@ class GuildMusic:
         # ✅ 반복 모드: "off" | "all" | "one"
         self.repeat_mode: str = "off"
 
+        # ✅ 스킵으로 끝난 곡은 반복 ALL에 다시 넣지 않기(원하던 UX 쪽)
+        self.skip_flag: bool = False
+
 
 music_data: Dict[int, GuildMusic] = {}
 
@@ -321,14 +324,12 @@ async def upsert_panel(guild: discord.Guild, music: GuildMusic):
     if not ch:
         return
 
-    # repeat_mode는 뷰 스타일에 쓰이므로 스냅샷으로 읽기
     async with music.lock:
         repeat_mode_snapshot = music.repeat_mode
 
     embed = build_panel_embed(guild, music)
-    view = MusicControlView(repeat_mode=repeat_mode_snapshot)  # ✅ repeat 색상 반영
+    view = MusicControlView(repeat_mode=repeat_mode_snapshot)
 
-    # 없으면 생성
     if not music.panel_message_id:
         try:
             msg = await ch.send(embed=embed, view=view)
@@ -337,7 +338,6 @@ async def upsert_panel(guild: discord.Guild, music: GuildMusic):
             print("패널 생성 실패:", repr(e), flush=True)
         return
 
-    # 있으면 수정
     try:
         msg = await ch.fetch_message(music.panel_message_id)
         await msg.edit(embed=embed, view=view)
@@ -353,13 +353,12 @@ class MusicControlView(discord.ui.View):
     """
     버튼 배치:
       1행: 일시정지 / 재생 / 셔플
-      2행: 반복 / 스킵 / 목록 / 나가
+      2행: 반복 / 스킵 / 목록 / 퇴장
     반복 버튼 색상:
       off=회색, all=초록, one=파랑
     """
     def __init__(self, repeat_mode: str = "off"):
         super().__init__(timeout=None)
-        # 생성 시점에 반복 모드에 맞춰 버튼 색상 반영
         self.repeat_btn.style = repeat_button_style(repeat_mode)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -385,7 +384,6 @@ class MusicControlView(discord.ui.View):
 
         return True
 
-    # 1행: 일시정지 / 재생 / 셔플
     @discord.ui.button(label="일시정지", style=discord.ButtonStyle.secondary, emoji="⏸️", row=0, custom_id="music_pause")
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         music = get_music(interaction.guild.id)
@@ -412,10 +410,6 @@ class MusicControlView(discord.ui.View):
 
     @discord.ui.button(label="셔플", style=discord.ButtonStyle.primary, emoji="🔀", row=0, custom_id="music_shuffle_once")
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """
-        입력값: 버튼 클릭
-        출력값: 대기열 1회 섞기(토글 없음), 현재곡 유지
-        """
         music = get_music(interaction.guild.id)
         touch_command(music)
 
@@ -426,13 +420,8 @@ class MusicControlView(discord.ui.View):
         await upsert_panel(interaction.guild, music)
         await interaction.response.defer()
 
-    # 2행: 반복 / 스킵 / 목록 / 나가
     @discord.ui.button(label="반복", style=discord.ButtonStyle.secondary, emoji="🔁", row=1, custom_id="music_repeat_cycle")
     async def repeat_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """
-        입력값: 버튼 클릭
-        출력값: 반복 모드 순환 OFF -> ALL -> ONE -> OFF
-        """
         music = get_music(interaction.guild.id)
         touch_command(music)
 
@@ -444,7 +433,6 @@ class MusicControlView(discord.ui.View):
             else:
                 music.repeat_mode = "off"
 
-            # 현재 뷰의 버튼 색상도 즉시 바꿔주기(체감 개선)
             button.style = repeat_button_style(music.repeat_mode)
 
         await upsert_panel(interaction.guild, music)
@@ -455,8 +443,8 @@ class MusicControlView(discord.ui.View):
         music = get_music(interaction.guild.id)
         touch_command(music)
 
-        # ✅ UI 잔상 방지: 즉시 현재곡 제거
         async with music.lock:
+            music.skip_flag = True  # ✅ 스킵 종료 표시
             music.now_playing = None
 
         vc = interaction.guild.voice_client
@@ -485,7 +473,8 @@ class MusicControlView(discord.ui.View):
         await upsert_panel(interaction.guild, music)
         await interaction.response.send_message("📃 대기열\n" + "\n".join(lines), ephemeral=True)
 
-    @discord.ui.button(label="나가", style=discord.ButtonStyle.danger, emoji="🚪", row=1, custom_id="music_leave")
+    # ✅ 버튼 라벨 변경: 나가 -> 퇴장 (custom_id는 유지해도 됨)
+    @discord.ui.button(label="퇴장", style=discord.ButtonStyle.danger, emoji="🚪", row=1, custom_id="music_leave")
     async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         music = get_music(interaction.guild.id)
         touch_command(music)
@@ -524,36 +513,31 @@ async def do_leave(guild: discord.Guild, music: GuildMusic):
     current = asyncio.current_task()
     vc = guild.voice_client
 
-    # 재생 중이면 중지
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
 
-    # 큐/현재곡 정리
     async with music.lock:
         music.queue.clear()
         music.now_playing = None
+        music.skip_flag = False
 
-    # 음성 채널 연결 해제
     try:
         if vc and vc.is_connected():
             await vc.disconnect()
     except Exception:
         pass
 
-    # ✅ 태스크 정리: 자기 자신은 취소하지 않음
     if music.player_task and not music.player_task.done() and music.player_task is not current:
         music.player_task.cancel()
 
     if music.idle_task and not music.idle_task.done() and music.idle_task is not current:
         music.idle_task.cancel()
 
-    # ✅ 패널 삭제는 취소 영향 받지 않게 보호
+    # ✅ 자동퇴장 시 패널 삭제가 끊기지 않게 보호
     try:
         await asyncio.shield(delete_panel(guild, music))
     except Exception:
         pass
-
-
 
 
 # ==============================
@@ -568,11 +552,11 @@ async def idle_watcher(guild: discord.Guild, music: GuildMusic):
             if not vc or not vc.is_connected():
                 return
 
-            # 재생/일시정지 중이면 유휴 아님 (5분 퇴장 방지)
+            # 재생/일시정지 중이면 유휴 아님
             if vc.is_playing() or vc.is_paused():
                 continue
 
-            # ✅ '아무것도 재생중이 아님' 상태만 카운트
+            # ✅ 아무것도 재생중이 아닐 때만 카운트
             async with music.lock:
                 has_queue = bool(music.queue)
                 has_now = (music.now_playing is not None)
@@ -589,8 +573,6 @@ async def idle_watcher(guild: discord.Guild, music: GuildMusic):
 
     except asyncio.CancelledError:
         return
-
-
 
 
 def ensure_idle_task(guild: discord.Guild, music: GuildMusic):
@@ -642,17 +624,26 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
             bot.loop.call_soon_threadsafe(music.next_event.set)
             continue
 
-        # 곡 종료(또는 stop) 대기
         await music.next_event.wait()
 
-        # ✅ 재생이 끝나서 아무것도 없어진 시점부터 5분 카운트 시작
+        # ✅ 곡 종료 후 반복 처리 + 5분 타이머 기준점(재생이 완전히 끝난 시점)
         async with music.lock:
+            was_skip = music.skip_flag
+            music.skip_flag = False
+
+            if music.repeat_mode == "all" and (not was_skip):
+                # 자연 종료일 때만 다시 뒤로(스킵은 제외)
+                music.queue.append(track)
+            elif music.repeat_mode == "one" and (not was_skip):
+                # 한곡 반복: 바로 다시 다음 곡으로 만들기 위해 맨 앞 삽입
+                music.queue.appendleft(track)
+
+            # 재생이 끝나서 "아무것도 없어진 시점"부터 5분 카운트
             if not music.queue:
                 music.now_playing = None
-                touch_command(music)  # ★ 여기서 카운트 시작점 리셋
+                touch_command(music)
 
         await upsert_panel(guild, music)
-
 
 
 # ==============================
@@ -662,7 +653,7 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
 async def on_ready():
     bootlog.info("READY_HIT: %s", bot.user)
 
-    # ✅ 재시작 후에도 기존 패널 버튼이 동작하도록 Persistent View 등록
+    # ✅ Persistent View 등록
     bot.add_view(MusicControlView())
 
     try:
@@ -694,7 +685,6 @@ async def play(interaction: discord.Interaction, 제목: str):
         touch_command(music)
         music.last_text_channel_id = interaction.channel_id
 
-        # ✅ 패널은 명령 친 채팅에 생성/유지
         music.panel_channel_id = interaction.channel_id
         ensure_idle_task(interaction.guild, music)
 
@@ -724,6 +714,50 @@ async def play(interaction: discord.Interaction, 제목: str):
 
     except Exception as e:
         await interaction.followup.send(f"추출/재생 실패: {type(e).__name__}: {e}")
+
+
+# ✅ 신규: 우선예약 (다음 곡)
+@bot.tree.command(name="우선예약", description="유튜브 URL 또는 제목을 다음 곡(대기열 맨 앞)으로 예약")
+@app_commands.describe(제목="URL 또는 제목 입력")
+async def priority_play(interaction: discord.Interaction, 제목: str):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        await connect_voice(interaction)
+        music = get_music(interaction.guild.id)
+
+        touch_command(music)
+        music.last_text_channel_id = interaction.channel_id
+
+        music.panel_channel_id = interaction.channel_id
+        ensure_idle_task(interaction.guild, music)
+
+        await upsert_panel(interaction.guild, music)
+
+        track = await extract_with_retry(제목)
+        track.requester = interaction.user.id
+
+        async with music.lock:
+            music.queue.appendleft(track)  # ✅ 다음 곡
+            position = 1
+
+        if not music.player_task or music.player_task.done():
+            music.player_task = asyncio.create_task(player_loop(interaction.guild, music))
+
+        await upsert_panel(interaction.guild, music)
+
+        msg = await interaction.followup.send(
+            f"⏩ 우선예약 완료: **{track.title}** (다음 곡)\n{track.url}",
+            suppress_embeds=True
+        )
+        await asyncio.sleep(2)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    except Exception as e:
+        await interaction.followup.send(f"우선예약 실패: {type(e).__name__}: {e}")
 
 
 @bot.tree.command(name="셔플", description="대기열을 1회 섞기(현재 재생중인 곡은 유지)")
@@ -795,8 +829,8 @@ async def skip(interaction: discord.Interaction):
         await interaction.followup.send("재생중인 음악이 없어.")
         return
 
-    # ✅ 잔상 방지
     async with music.lock:
+        music.skip_flag = True
         music.now_playing = None
 
     vc.stop()
@@ -804,7 +838,8 @@ async def skip(interaction: discord.Interaction):
     await interaction.followup.send("⏭️ 다음꺼야.")
 
 
-@bot.tree.command(name="나가", description="음악 종료 + 대기열 비움 + 봇 퇴장")
+# ✅ 변경: /나가 -> /퇴장
+@bot.tree.command(name="퇴장", description="음악 종료 + 대기열 비움 + 봇 퇴장")
 async def leave(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
@@ -896,4 +931,3 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
-
