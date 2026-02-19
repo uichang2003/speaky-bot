@@ -217,35 +217,57 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
 
     embed = discord.Embed(title="곽덕춘")
 
-    # ✅ 현재 재생중: 가독성(위/아래 여백) + 기존 형태 유지
+    # =============================
+    # 상단 상태 줄
+    # =============================
     if now:
-        dur = fmt_time(now.duration)
+        requester_name = _requester_name(guild, now.requester)
+    else:
+        requester_name = "-"
 
-        # 위/아래 줄바꿈으로 "덩어리"를 만들어 눈에 들어오게
-        now_line = f"\n🎵 **{now.title}** ({dur})\n"
-        embed.add_field(name="현재 재생중", value=now_line, inline=False)
+    embed.add_field(
+        name="",
+        value=f"상태: {status} | 요청자: {requester_name} | 통화방: {channel_name}",
+        inline=False,
+    )
 
-        # ✅ 썸네일: 오른쪽 작은 이미지
+    # =============================
+    # 현재 재생중
+    # =============================
+    if now:
+        duration = fmt_time(now.duration)
+        embed.add_field(
+            name="현재 재생중",
+            value=f"🎵 {now.title} ({duration})",
+            inline=False,
+        )
+
         if now.thumbnail:
             embed.set_thumbnail(url=now.thumbnail)
-
-        # ✅ 요청자/상태는 덜 눈에 띄게: Footer로 이동
-        req_name = _requester_name(guild, now.requester)
-        embed.set_footer(text=f"상태: {status} | 요청자: {req_name} | 통화방: {channel_name}")
-
     else:
-        embed.add_field(name="현재 재생중", value="\n없음\n", inline=False)
-        embed.set_footer(text=f"상태: {status} | 통화방: {channel_name}")
+        embed.add_field(
+            name="현재 재생중",
+            value="없음",
+            inline=False,
+        )
 
-    # ✅ 다음 노래 1개만 표시(간단하게)
+    # =============================
+    # 다음 노래
+    # =============================
     if next_track:
-        embed.add_field(name="다음 노래", value=f"{next_track.title}", inline=False)
+        embed.add_field(
+            name="다음 노래",
+            value=f"{next_track.title}",
+            inline=False,
+        )
     else:
-        embed.add_field(name="다음 노래", value="없음", inline=False)
+        embed.add_field(
+            name="다음 노래",
+            value="없음",
+            inline=False,
+        )
 
     return embed
-
-
 
 
 async def fetch_panel_channel(guild: discord.Guild, music: GuildMusic) -> Optional[discord.abc.Messageable]:
@@ -747,6 +769,7 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
 
 
 
