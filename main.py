@@ -43,10 +43,17 @@ YTDLP_OPTIONS = {
     "retries": 3,
     "fragment_retries": 3,
 
-    # 🔥 User-Agent 추가 (브라우저처럼 보이게)
+    # ✅ User-Agent (이미 정상)
     "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        )
     },
+
+    # 🔥 EJS 원격 컴포넌트 허용 (안정성 보강 핵심)
+    "remote_components": ["ejs:github"],
 }
 
 
@@ -468,4 +475,5 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
 
