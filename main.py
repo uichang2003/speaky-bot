@@ -218,7 +218,7 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
     embed = discord.Embed(title="곽덕춘")
 
     # ==========================
-    # 상태 줄 (일반 굵기)
+    # 상태 줄
     # ==========================
     requester_name = _requester_name(guild, now.requester) if now else "-"
 
@@ -228,39 +228,50 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
         inline=False,
     )
 
-    # 🔽 여백(줄간격)
+    # 🔽 여백 추가
     embed.add_field(name="\u200b", value="\u200b", inline=False)
 
     # ==========================
-    # 현재 재생중 (이 부분만 굵게)
+    # 현재 재생중
     # ==========================
     if now:
         duration = fmt_time(now.duration)
+
         embed.add_field(
             name="현재 재생중",
             value=f"🎵 **{now.title} ({duration})**",
             inline=False,
         )
 
-        # ✅ 썸네일(오른쪽) 대신 하단 큰 이미지
         if now.thumbnail:
-            embed.set_image(url=now.thumbnail)
+            embed.set_thumbnail(url=now.thumbnail)
     else:
-        embed.add_field(name="현재 재생중", value="없음", inline=False)
+        embed.add_field(
+            name="현재 재생중",
+            value="없음",
+            inline=False,
+        )
 
-    # 🔽 여백(줄간격)
+    # 🔽 여백 추가
     embed.add_field(name="\u200b", value="\u200b", inline=False)
 
     # ==========================
-    # 다음 노래 (일반 굵기)
+    # 다음 노래
     # ==========================
     if next_track:
-        embed.add_field(name="다음 노래", value=f"{next_track.title}", inline=False)
+        embed.add_field(
+            name="다음 노래",
+            value=f"{next_track.title}",
+            inline=False,
+        )
     else:
-        embed.add_field(name="다음 노래", value="없음", inline=False)
+        embed.add_field(
+            name="다음 노래",
+            value="없음",
+            inline=False,
+        )
 
     return embed
-
 
 
 
@@ -463,26 +474,42 @@ async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient
 
 async def do_leave(guild: discord.Guild, music: GuildMusic):
     vc = guild.voice_client
+
+    # 재생 중이면 중지
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
 
+    # 대기열 정리
     async with music.lock:
         music.queue.clear()
         music.now_playing = None
 
+    # 음성 채널 연결 해제
     try:
         if vc and vc.is_connected():
             await vc.disconnect()
     except Exception:
         pass
 
+    # 태스크 정리
     if music.player_task and not music.player_task.done():
         music.player_task.cancel()
+
     if music.idle_task and not music.idle_task.done():
         music.idle_task.cancel()
 
-    # ✅ 패널 삭제
-    await delete_panel(guild, music)
+    # ✅ 인터페이스(패널) 삭제 처리
+    if music.panel_message_id:
+        try:
+            channel = guild.get_channel(music.last_text_channel_id)
+            if channel:
+                msg = await channel.fetch_message(music.panel_message_id)
+                await msg.delete()
+        except Exception:
+            pass
+
+        music.panel_message_id = None
+
 
 
 # ==============================
@@ -763,6 +790,7 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
 
 
 
