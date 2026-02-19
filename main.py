@@ -29,20 +29,18 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 # yt-dlp 설정
 # ==============================
 YTDLP_OPTIONS = {
-    "format": "bestaudio[abr>=160]/bestaudio/best",
+    "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
 
-    # ✅ 간헐 차단 완화
     "sleep_requests": 1,
     "sleep_interval": 1,
     "max_sleep_interval": 3,
     "retries": 3,
     "fragment_retries": 3,
 
-    # ✅ User-Agent
     "http_headers": {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -51,8 +49,13 @@ YTDLP_OPTIONS = {
         )
     },
 
-    # ✅ EJS 원격 컴포넌트 허용
     "remote_components": ["ejs:github"],
+
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android"]
+        }
+    },
 }
 
 
@@ -744,6 +747,7 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
 
 
 
