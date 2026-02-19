@@ -519,31 +519,41 @@ async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient
 async def do_leave(guild: discord.Guild, music: GuildMusic):
     """
     입력: guild, music
-    출력: 재생 중지 + 큐 초기화 + 음성 해제 + 태스크 취소 + 패널 삭제
+    출력: 재생 중지 + 큐 초기화 + 음성 해제 + 태스크 정리 + 패널 삭제
     """
+    current = asyncio.current_task()
     vc = guild.voice_client
 
+    # 재생 중이면 중지
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
 
+    # 큐/현재곡 정리
     async with music.lock:
         music.queue.clear()
         music.now_playing = None
-        music.repeat_mode = "off"  # 나갈 때 반복은 초기화(원치 않으면 제거 가능)
 
+    # 음성 채널 연결 해제
     try:
         if vc and vc.is_connected():
             await vc.disconnect()
     except Exception:
         pass
 
-    if music.player_task and not music.player_task.done():
+    # ✅ 태스크 정리: 자기 자신은 취소하지 않음
+    if music.player_task and not music.player_task.done() and music.player_task is not current:
         music.player_task.cancel()
 
-    if music.idle_task and not music.idle_task.done():
+    if music.idle_task and not music.idle_task.done() and music.idle_task is not current:
         music.idle_task.cancel()
 
-    await delete_panel(guild, music)
+    # ✅ 패널 삭제는 취소 영향 받지 않게 보호
+    try:
+        await asyncio.shield(delete_panel(guild, music))
+    except Exception:
+        pass
+
+
 
 
 # ==============================
@@ -558,13 +568,16 @@ async def idle_watcher(guild: discord.Guild, music: GuildMusic):
             if not vc or not vc.is_connected():
                 return
 
+            # 재생/일시정지 중이면 유휴 아님 (5분 퇴장 방지)
             if vc.is_playing() or vc.is_paused():
                 continue
 
+            # ✅ '아무것도 재생중이 아님' 상태만 카운트
             async with music.lock:
                 has_queue = bool(music.queue)
+                has_now = (music.now_playing is not None)
 
-            if has_queue:
+            if has_queue or has_now:
                 continue
 
             elapsed = time.monotonic() - music.last_command_ts
@@ -573,8 +586,11 @@ async def idle_watcher(guild: discord.Guild, music: GuildMusic):
 
             await do_leave(guild, music)
             return
+
     except asyncio.CancelledError:
         return
+
+
 
 
 def ensure_idle_task(guild: discord.Guild, music: GuildMusic):
@@ -591,25 +607,20 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
         music.next_event.clear()
 
         async with music.lock:
-            # 큐도 없고 ONE 반복도 아니면 now_playing 비우기
-            if not music.queue and music.repeat_mode != "one":
+            if not music.queue:
                 music.now_playing = None
 
-        # 큐 대기 (ONE 반복이면 큐 없이도 재생 가능하므로 분기)
+        # 큐 대기
         while True:
             async with music.lock:
-                can_start = bool(music.queue) or (music.repeat_mode == "one" and music.now_playing is not None)
-                if can_start:
+                if music.queue:
                     break
             await asyncio.sleep(0.5)
 
-        # 다음 곡 결정
+        # 다음 곡
         async with music.lock:
-            if music.repeat_mode == "one" and music.now_playing is not None:
-                track = music.now_playing
-            else:
-                track = music.queue.popleft()
-                music.now_playing = track
+            track = music.queue.popleft()
+            music.now_playing = track
 
         vc = guild.voice_client
         if not vc or not vc.is_connected():
@@ -631,29 +642,17 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
             bot.loop.call_soon_threadsafe(music.next_event.set)
             continue
 
+        # 곡 종료(또는 stop) 대기
         await music.next_event.wait()
 
-        # ✅ 곡 종료 처리 (OFF/ALL/ONE)
+        # ✅ 재생이 끝나서 아무것도 없어진 시점부터 5분 카운트 시작
         async with music.lock:
-            ended = music.now_playing
-
-            if ended is not None:
-                if music.repeat_mode == "all":
-                    music.queue.append(ended)
-                elif music.repeat_mode == "one":
-                    # 같은 곡 다시 재생(큐 조작 없음)
-                    pass
-                else:
-                    # off: 큐 조작 없음
-                    pass
-
-            # ONE이 아니고 큐가 비면 now_playing 비우기(잔상 방지) + idle 타이머 갱신
-            if music.repeat_mode != "one":
-                if not music.queue:
-                    music.now_playing = None
-                    touch_command(music)
+            if not music.queue:
+                music.now_playing = None
+                touch_command(music)  # ★ 여기서 카운트 시작점 리셋
 
         await upsert_panel(guild, music)
+
 
 
 # ==============================
@@ -897,3 +896,4 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
