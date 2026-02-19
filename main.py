@@ -214,37 +214,52 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
     channel_name = vc.channel.name if (vc and vc.is_connected() and vc.channel) else "-"
 
     now = music.now_playing
+    next_track = None
+
+    if music.queue:
+        next_track = music.queue[0]
+
+    # ======================
+    # 현재 재생중
+    # ======================
     if now:
         req_name = _requester_name(guild, now.requester)
         dur = fmt_time(now.duration)
+
         now_line = (
-            f"**{now.title}**\n"
-            f"요청자: {req_name}\n"
-            f"길이: `{dur}`\n"
+            f"🎵 **{now.title}**\n\n"
+            f"👤 요청자: {req_name}\n"
+            f"⏱ 길이: `{dur}`\n"
             f"{now.url}"
         )
     else:
         now_line = "없음"
 
+    # ======================
+    # 다음 노래 1개만 표시
+    # ======================
+    if next_track:
+        next_line = f"**{next_track.title}**"
+    else:
+        next_line = "없음"
+
+    # ======================
+    # Embed 생성
+    # ======================
     embed = discord.Embed(
-        title="🎛️ 음악 컨트롤",
-        description="통화방에 참여중인 사람만 버튼을 사용할 수 있어요.",
+        title="곽덕춘",
+        description=f"**상태:** {status}\n통화방: **{channel_name}**",
     )
-    embed.add_field(name="상태", value=f"{status}\n통화방: **{channel_name}**", inline=False)
-    embed.add_field(name="현재 재생", value=now_line, inline=False)
 
-    # 대기열 미리보기(최대 5개)
-    q_list = list(music.queue)
-    preview: List[str] = [f"{i}. {t.title}" for i, t in enumerate(q_list[:5], start=1)]
-    if len(q_list) > 5:
-        preview.append(f"... 그리고 {len(q_list) - 5}개 더 있어요.")
-    embed.add_field(name=f"대기열 ({len(q_list)}개)", value=("\n".join(preview) if preview else "비어있음"), inline=False)
+    embed.add_field(name="현재 재생중", value=now_line, inline=False)
+    embed.add_field(name="다음 노래", value=next_line, inline=False)
 
-    # ✅ 썸네일 (작게)
+    # ✅ 썸네일 크게 표시
     if now and now.thumbnail:
-        embed.set_thumbnail(url=now.thumbnail)
+        embed.set_image(url=now.thumbnail)
 
     return embed
+
 
 
 async def fetch_panel_channel(guild: discord.Guild, music: GuildMusic) -> Optional[discord.abc.Messageable]:
@@ -746,3 +761,4 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
