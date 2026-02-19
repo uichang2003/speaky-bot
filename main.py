@@ -13,18 +13,17 @@ from discord.ext import commands
 import yt_dlp
 
 # ==============================
-# ✅ 부팅/동기화 로그(확정 출력)
+# ✅ 부팅/동기화 로그
 # ==============================
 logging.basicConfig(level=logging.INFO)
 bootlog = logging.getLogger("boot")
-
 print("BOOT: main.py 실행됨", flush=True)
 
 # ==============================
 # 설정
 # ==============================
-IDLE_TIMEOUT_SEC = 5 * 60  # ✅ 퇴장 시간(초)
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))  # Railway Variables에 GUILD_ID 추가 추천
+IDLE_TIMEOUT_SEC = 5 * 60
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 # ==============================
 # yt-dlp 설정
@@ -52,14 +51,14 @@ YTDLP_OPTIONS = {
         )
     },
 
-    # ✅ EJS 원격 컴포넌트 허용(안정성 보강)
+    # ✅ EJS 원격 컴포넌트 허용
     "remote_components": ["ejs:github"],
 }
 
 
 def prepare_cookiefile() -> Optional[str]:
     """
-    입력: 환경변수 YOUTUBE_COOKIES_B64 (cookies.txt를 base64 인코딩한 문자열)
+    입력: 환경변수 YOUTUBE_COOKIES_B64 (cookies.txt base64)
     출력: /tmp/cookies.txt 경로 (없으면 None)
     """
     b64 = os.getenv("YOUTUBE_COOKIES_B64")
@@ -100,6 +99,8 @@ class Track:
     url: str
     stream_url: str
     requester: int
+    duration: Optional[int] = None      # 총 길이(초)
+    thumbnail: Optional[str] = None     # 썸네일 URL
 
 
 class GuildMusic:
@@ -110,14 +111,13 @@ class GuildMusic:
         self.next_event = asyncio.Event()
         self.player_task: Optional[asyncio.Task] = None
 
-        # 무활동(명령 없음) 자동 퇴장용
         self.last_command_ts: float = time.monotonic()
         self.idle_task: Optional[asyncio.Task] = None
 
-        # ✅ 마지막으로 명령을 친 텍스트 채널(패널 출력용)
+        # 마지막 명령 채널(패널 표시용)
         self.last_text_channel_id: Optional[int] = None
 
-        # ✅ 컨트롤 패널 메시지(1개 유지)
+        # ✅ 패널 메시지(1개 유지)
         self.panel_channel_id: Optional[int] = None
         self.panel_message_id: Optional[int] = None
 
@@ -132,14 +132,22 @@ def get_music(guild_id: int) -> GuildMusic:
 
 
 def touch_command(music: GuildMusic):
-    """명령이 들어올 때마다 호출해서 타이머 리셋"""
     music.last_command_ts = time.monotonic()
+
+
+def fmt_time(sec: Optional[int]) -> str:
+    if sec is None:
+        return "--:--"
+    sec = max(0, int(sec))
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def extract_info(제목: str) -> Track:
     """
-    입력: 제목 (유튜브 URL 또는 제목)
-    출력: Track(title, url, stream_url, requester)
+    입력: 제목(유튜브 URL 또는 검색어)
+    출력: Track
     """
     with yt_dlp.YoutubeDL(YTDLP_OPTIONS) as ydl:
         info = ydl.extract_info(제목, download=False)
@@ -154,15 +162,20 @@ def extract_info(제목: str) -> Track:
     if not stream_url:
         raise Exception("스트림 URL을 가져오지 못했습니다.")
 
-    return Track(title=title, url=webpage_url, stream_url=stream_url, requester=0)
+    duration = info.get("duration")  # 초
+    thumbnail = info.get("thumbnail")
+
+    return Track(
+        title=title,
+        url=webpage_url,
+        stream_url=stream_url,
+        requester=0,
+        duration=duration,
+        thumbnail=thumbnail,
+    )
 
 
 async def extract_with_retry(query: str) -> Track:
-    """
-    입력: query(제목/URL)
-    출력: Track
-    - 간헐 오류 대비: 1회 재시도
-    """
     try:
         return await asyncio.to_thread(extract_info, query)
     except Exception as e:
@@ -175,7 +188,7 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==============================
-# 패널(컨트롤 UI) 관련
+# 패널(임베드+버튼) 유틸
 # ==============================
 def _get_status_text(guild: discord.Guild) -> str:
     vc = guild.voice_client
@@ -203,7 +216,13 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
     now = music.now_playing
     if now:
         req_name = _requester_name(guild, now.requester)
-        now_line = f"**{now.title}**\n요청자: {req_name}\n{now.url}"
+        dur = fmt_time(now.duration)
+        now_line = (
+            f"**{now.title}**\n"
+            f"요청자: {req_name}\n"
+            f"길이: `{dur}`\n"
+            f"{now.url}"
+        )
     else:
         now_line = "없음"
 
@@ -214,14 +233,16 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
     embed.add_field(name="상태", value=f"{status}\n통화방: **{channel_name}**", inline=False)
     embed.add_field(name="현재 재생", value=now_line, inline=False)
 
-    # 큐 미리보기(최대 5개)
-    preview: List[str] = []
+    # 대기열 미리보기(최대 5개)
     q_list = list(music.queue)
-    for i, t in enumerate(q_list[:5], start=1):
-        preview.append(f"{i}. {t.title}")
+    preview: List[str] = [f"{i}. {t.title}" for i, t in enumerate(q_list[:5], start=1)]
     if len(q_list) > 5:
         preview.append(f"... 그리고 {len(q_list) - 5}개 더 있어요.")
     embed.add_field(name=f"대기열 ({len(q_list)}개)", value=("\n".join(preview) if preview else "비어있음"), inline=False)
+
+    # ✅ 썸네일 (작게)
+    if now and now.thumbnail:
+        embed.set_thumbnail(url=now.thumbnail)
 
     return embed
 
@@ -261,9 +282,6 @@ async def delete_panel(guild: discord.Guild, music: GuildMusic):
 
 
 async def upsert_panel(guild: discord.Guild, music: GuildMusic):
-    """
-    패널이 없으면 생성, 있으면 embed만 갱신
-    """
     ch = await fetch_panel_channel(guild, music)
     if not ch:
         return
@@ -283,11 +301,14 @@ async def upsert_panel(guild: discord.Guild, music: GuildMusic):
         msg = await ch.fetch_message(music.panel_message_id)
         await msg.edit(embed=embed, view=view)
     except Exception:
-        # 메시지가 지워졌거나 접근 불가이면 새로 만들기
+        # 메시지가 삭제/접근불가 -> 새로 생성
         music.panel_message_id = None
         await upsert_panel(guild, music)
 
 
+# ==============================
+# 버튼 UI
+# ==============================
 class MusicControlView(discord.ui.View):
     """
     ✅ 버튼 조작 권한: '봇이 있는 통화방'에 들어와 있는 사람만 가능
@@ -302,6 +323,7 @@ class MusicControlView(discord.ui.View):
 
         vc = interaction.guild.voice_client
         if not vc or not vc.is_connected() or not vc.channel:
+            # 본인에게만 안내
             await interaction.response.send_message("지금 통화방에 없어.", ephemeral=True)
             return False
 
@@ -325,7 +347,8 @@ class MusicControlView(discord.ui.View):
             vc.pause()
 
         await upsert_panel(interaction.guild, music)
-        await interaction.response.send_message("⏸️ 일시정지.", ephemeral=True)
+        # ✅ 메시지 표시 안 함
+        await interaction.response.defer()
 
     @discord.ui.button(label="재생", style=discord.ButtonStyle.success, emoji="▶️", row=0)
     async def resume_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -337,7 +360,8 @@ class MusicControlView(discord.ui.View):
             vc.resume()
 
         await upsert_panel(interaction.guild, music)
-        await interaction.response.send_message("▶️ 재생.", ephemeral=True)
+        # ✅ 메시지 표시 안 함
+        await interaction.response.defer()
 
     @discord.ui.button(label="현재노래", style=discord.ButtonStyle.primary, emoji="🎵", row=0)
     async def now_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -346,12 +370,14 @@ class MusicControlView(discord.ui.View):
 
         if music.now_playing:
             req = _requester_name(interaction.guild, music.now_playing.requester)
-            msg = f"🎵 현재 재생: **{music.now_playing.title}** (요청자: {req})\n{music.now_playing.url}"
+            dur = fmt_time(music.now_playing.duration)
+            msg = f"🎵 현재 재생: **{music.now_playing.title}**\n요청자: {req}\n길이: `{dur}`\n{music.now_playing.url}"
         else:
             msg = "지금 재생중인 곡이 없어."
 
         await upsert_panel(interaction.guild, music)
-        await interaction.response.send_message(msg, ephemeral=True)
+        # ✅ 본인에게만 표시
+        await interaction.response.send_message(msg, ephemeral=True, suppress_embeds=True)
 
     @discord.ui.button(label="스킵", style=discord.ButtonStyle.danger, emoji="⏭️", row=1)
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -359,13 +385,12 @@ class MusicControlView(discord.ui.View):
         touch_command(music)
 
         vc = interaction.guild.voice_client
-        if not vc or not vc.is_connected() or not (vc.is_playing() or vc.is_paused()):
-            await interaction.response.send_message("재생중인 음악이 없어.", ephemeral=True)
-            return
+        if vc and vc.is_connected() and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
 
-        vc.stop()  # after 콜백에서 다음 곡으로 진행
         await upsert_panel(interaction.guild, music)
-        await interaction.response.send_message("⏭️ 다음 곡으로 넘어갈게.", ephemeral=True)
+        # ✅ 메시지 표시 안 함
+        await interaction.response.defer()
 
     @discord.ui.button(label="목록", style=discord.ButtonStyle.secondary, emoji="📃", row=1)
     async def list_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -384,30 +409,27 @@ class MusicControlView(discord.ui.View):
                 lines.append(f"...그리고 {more}개 더 있어.")
 
         await upsert_panel(interaction.guild, music)
+        # ✅ 목록만 본인에게 표시
         await interaction.response.send_message("📃 대기열\n" + "\n".join(lines), ephemeral=True)
 
     @discord.ui.button(label="나가", style=discord.ButtonStyle.danger, emoji="🚪", row=1)
     async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         music = get_music(interaction.guild.id)
         touch_command(music)
+
         await do_leave(interaction.guild, music)
-        await interaction.response.send_message("🚪 나갈게.", ephemeral=True)
+        # ✅ 메시지 표시 안 함
+        await interaction.response.defer()
 
 
 # ==============================
-# 보이스 연결/종료 공통
+# 보이스 연결/퇴장 공통
 # ==============================
 async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient:
-    """
-    입력: interaction
-    출력: VoiceClient
-    """
     if not interaction.guild:
         raise Exception("길드(서버)에서만 사용할 수 있습니다.")
-
     if not interaction.user or not isinstance(interaction.user, discord.Member):
         raise Exception("사용자 정보를 가져오지 못했습니다.")
-
     if not interaction.user.voice or not interaction.user.voice.channel:
         raise Exception("음성채널 먼저 들어가.")
 
@@ -423,10 +445,6 @@ async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient
 
 
 async def do_leave(guild: discord.Guild, music: GuildMusic):
-    """
-    입력: guild, music
-    출력: 없음 (퇴장 + 큐정리 + 패널 삭제)
-    """
     vc = guild.voice_client
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
@@ -451,13 +469,9 @@ async def do_leave(guild: discord.Guild, music: GuildMusic):
 
 
 # ==============================
-# 유휴 감시 (자동 퇴장)
+# 유휴 감시
 # ==============================
 async def idle_watcher(guild: discord.Guild, music: GuildMusic):
-    """
-    ✅ 재생중/일시정지/큐 존재 시 퇴장 금지
-    ✅ '재생도 없고 + 큐도 비어있는' 유휴 상태에서만 5분 무명령이면 퇴장
-    """
     try:
         while True:
             await asyncio.sleep(2)
@@ -479,7 +493,6 @@ async def idle_watcher(guild: discord.Guild, music: GuildMusic):
             if elapsed < IDLE_TIMEOUT_SEC:
                 continue
 
-            # ✅ 자동퇴장
             await do_leave(guild, music)
             return
     except asyncio.CancelledError:
@@ -503,14 +516,14 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
             if not music.queue:
                 music.now_playing = None
 
-        # 큐에 곡이 들어올 때까지 대기
+        # 큐 대기
         while True:
             async with music.lock:
                 if music.queue:
                     break
             await asyncio.sleep(0.5)
 
-        # 곡 꺼내기
+        # 다음 곡
         async with music.lock:
             track = music.queue.popleft()
             music.now_playing = track
@@ -530,7 +543,7 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
             vc.play(source, after=after_play)
             print(f"[재생 시작] {track.title}", flush=True)
 
-            # ✅ 패널 갱신(현재곡 표시)
+            # ✅ 패널 갱신
             await upsert_panel(guild, music)
 
         except Exception as e:
@@ -545,12 +558,11 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
             if not music.queue:
                 touch_command(music)
 
-        # 곡 끝난 뒤에도 패널 갱신(상태/대기열 반영)
         await upsert_panel(guild, music)
 
 
 # ==============================
-# 봇 이벤트
+# 이벤트
 # ==============================
 @bot.event
 async def on_ready():
@@ -585,11 +597,11 @@ async def play(interaction: discord.Interaction, 제목: str):
         touch_command(music)
         music.last_text_channel_id = interaction.channel_id
 
-        # ✅ 패널을 '명령 친 채팅'에 생성/유지
+        # ✅ 패널은 명령 친 채팅에 생성/유지
         music.panel_channel_id = interaction.channel_id
         ensure_idle_task(interaction.guild, music)
 
-        # 패널이 없으면 먼저 만들어둠(입장 시점)
+        # 패널 없으면 생성
         await upsert_panel(interaction.guild, music)
 
         track = await extract_with_retry(제목)
@@ -604,9 +616,16 @@ async def play(interaction: discord.Interaction, 제목: str):
 
         await upsert_panel(interaction.guild, music)
 
-        await interaction.followup.send(
-            f"🎵 **{track.title}** 대기열 추가 (위치: {position})\n{track.url}"
+        # ✅ 2초만 표시 후 삭제(채팅에 쌓이지 않게)
+        msg = await interaction.followup.send(
+            f"🎵 **{track.title}** 대기열 추가 (위치: {position})\n{track.url}",
+            suppress_embeds=True
         )
+        await asyncio.sleep(2)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
 
     except Exception as e:
         await interaction.followup.send(f"오류: {type(e).__name__}: {e}")
@@ -675,10 +694,7 @@ async def queue_list(interaction: discord.Interaction):
             return
 
         items = list(music.queue)[:20]
-        lines = []
-        for i, t in enumerate(items, start=1):
-            lines.append(f"{i}. **{t.title}**")
-
+        lines = [f"{i}. **{t.title}**" for i, t in enumerate(items, start=1)]
         more = len(music.queue) - len(items)
         if more > 0:
             lines.append(f"...그리고 {more}개 더 있어.")
