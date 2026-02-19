@@ -4,7 +4,7 @@ import time
 import logging
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, Optional, List, Tuple
 
 import discord
 from discord import app_commands
@@ -24,6 +24,8 @@ print("BOOT: main.py 실행됨", flush=True)
 IDLE_TIMEOUT_SEC = 5 * 60
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
+PLAYLIST_LIMIT = 100               # ✅ 플레이리스트 최대 추가 곡 수
+
 # ==============================
 # 문구(통일)
 # ==============================
@@ -31,11 +33,12 @@ MSG_NEED_VOICE = "통화방에 들어와야 쓸 수 있어."
 MSG_BOT_NOT_IN_VOICE = "지금 봇이 통화방에 없어."
 MSG_NEED_SAME_VOICE = "봇이 있는 통화방에 들어와야 쓸 수 있어."
 MSG_DIFF_VOICE_IN_USE = "다른 통화방에서 날 쓰는 중이야."
+MSG_BUSY = "지금 플레이리스트 처리중이야. 잠깐만."
 
 # ==============================
 # yt-dlp 설정 (✅ 쿠키 미사용)
 # ==============================
-YTDLP_OPTIONS = {
+YTDLP_OPTIONS_SINGLE = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
@@ -55,10 +58,16 @@ YTDLP_OPTIONS = {
     },
     "remote_components": ["ejs:github"],
     "extractor_args": {
-        "youtube": {
-            "player_client": ["android"]
-        }
+        "youtube": {"player_client": ["android"]}
     },
+}
+
+# ✅ 플레이리스트 "목록만" 뽑는 옵션(스트림 URL 추출은 재생 직전)
+YTDLP_OPTIONS_PLAYLIST_FLAT = {
+    **YTDLP_OPTIONS_SINGLE,
+    "noplaylist": False,
+    "extract_flat": "in_playlist",
+    "skip_download": True,
 }
 
 # ==============================
@@ -76,7 +85,7 @@ FFMPEG_OPTIONS = {
 class Track:
     title: str
     url: str
-    stream_url: str
+    stream_url: Optional[str]      # ✅ 지연 추출 때문에 Optional
     requester: int
     duration: Optional[int] = None
     thumbnail: Optional[str] = None
@@ -94,18 +103,20 @@ class GuildMusic:
         self.last_command_ts: float = time.monotonic()
         self.idle_task: Optional[asyncio.Task] = None
 
-        # 마지막 명령 채널 (참고용)
-        self.last_text_channel_id: Optional[int] = None
-
-        # ✅ 패널 메시지 1개 유지
+        # 패널
         self.panel_channel_id: Optional[int] = None
         self.panel_message_id: Optional[int] = None
 
-        # ✅ 반복 모드: "off" | "all" | "one"
-        self.repeat_mode: str = "off"
+        # 반복 모드
+        self.repeat_mode: str = "off"   # "off" | "all" | "one"
 
-        # ✅ 스킵으로 끝난 곡은 ALL 반복에 다시 넣지 않기
+        # 스킵 플래그(스킵 종료는 repeat에 재삽입 안 함)
         self.skip_flag: bool = False
+
+        # ✅ 플레이리스트 처리 중 잠금 + 취소용 태스크 핸들
+        self.is_busy: bool = False
+        self.busy_lock: asyncio.Lock = asyncio.Lock()
+        self.playlist_task: Optional[asyncio.Task] = None
 
 
 music_data: Dict[int, GuildMusic] = {}
@@ -139,7 +150,6 @@ def repeat_label(mode: str) -> str:
 
 
 def repeat_button_style(mode: str) -> discord.ButtonStyle:
-    # off: 회색(secondary), all: 초록(success), one: 파랑(primary)
     if mode == "all":
         return discord.ButtonStyle.success
     if mode == "one":
@@ -148,10 +158,6 @@ def repeat_button_style(mode: str) -> discord.ButtonStyle:
 
 
 def shuffle_queue_inplace(music: GuildMusic):
-    """
-    입력값: music.queue (현재 재생중 now_playing은 건드리지 않음)
-    출력값: 대기열(queue)만 랜덤 섞임
-    """
     import random
     q = list(music.queue)
     random.shuffle(q)
@@ -159,12 +165,26 @@ def shuffle_queue_inplace(music: GuildMusic):
     music.queue.extend(q)
 
 
-def extract_info(query: str) -> Track:
+# ==============================
+# ✅ 플레이리스트 자동 인식
+# ==============================
+def is_youtube_playlist_input(q: str) -> bool:
+    s = q.strip()
+    if "list=" not in s:
+        return False
+    if "youtube.com/playlist" in s:
+        return True
+    if "youtube.com/watch" in s and "list=" in s:
+        return True
+    return False
+
+
+def extract_single_track(query: str) -> Track:
     """
-    입력: query (유튜브 URL 또는 검색어)
-    출력: Track
+    입력값: query(유튜브 URL 또는 검색어)
+    출력값: Track(단일곡, stream_url 포함)
     """
-    with yt_dlp.YoutubeDL(YTDLP_OPTIONS) as ydl:
+    with yt_dlp.YoutubeDL(YTDLP_OPTIONS_SINGLE) as ydl:
         info = ydl.extract_info(query, download=False)
 
     if "entries" in info and info["entries"]:
@@ -175,30 +195,53 @@ def extract_info(query: str) -> Track:
 
     stream_url = info.get("url")
     if not stream_url:
-        raise Exception("스트림 URL을 가져오지 못했어.")
-
-    duration = info.get("duration")
-    thumbnail = info.get("thumbnail")
+        raise Exception("스트림 URL을 못 가져왔어.")
 
     return Track(
         title=title,
         url=webpage_url,
         stream_url=stream_url,
         requester=0,
-        duration=duration,
-        thumbnail=thumbnail,
+        duration=info.get("duration"),
+        thumbnail=info.get("thumbnail"),
     )
 
 
-async def extract_with_retry(query: str) -> Track:
+def extract_playlist_flat(playlist_url: str, limit: int = PLAYLIST_LIMIT) -> List[Tuple[str, str]]:
     """
-    입력: query
-    출력: Track (성공) / 예외(최종 실패)
+    입력값: playlist_url, limit
+    출력값: [(title, video_url), ...] 최대 limit개
     """
+    with yt_dlp.YoutubeDL(YTDLP_OPTIONS_PLAYLIST_FLAT) as ydl:
+        info = ydl.extract_info(playlist_url, download=False)
+
+    entries = info.get("entries") or []
+    out: List[Tuple[str, str]] = []
+
+    for e in entries:
+        if not e:
+            continue
+
+        title = e.get("title") or "Unknown Title"
+
+        u = e.get("url") or e.get("webpage_url") or ""
+        if u and not u.startswith("http"):
+            u = "https://www.youtube.com/watch?v=" + u
+        if not u:
+            continue
+
+        out.append((title, u))
+        if len(out) >= limit:
+            break
+
+    return out
+
+
+async def extract_with_retry_single(query: str) -> Track:
     last_err: Optional[Exception] = None
-    for attempt in range(1, 5):  # 1~4회
+    for attempt in range(1, 5):
         try:
-            return await asyncio.to_thread(extract_info, query)
+            return await asyncio.to_thread(extract_single_track, query)
         except Exception as e:
             last_err = e
             print(f"{attempt}차 추출 실패:", repr(e), flush=True)
@@ -206,18 +249,25 @@ async def extract_with_retry(query: str) -> Track:
     raise last_err if last_err else Exception("알 수 없는 추출 실패")
 
 
+async def extract_with_retry_playlist_flat(url: str, limit: int) -> List[Tuple[str, str]]:
+    last_err: Optional[Exception] = None
+    for attempt in range(1, 4):
+        try:
+            return await asyncio.to_thread(extract_playlist_flat, url, limit)
+        except Exception as e:
+            last_err = e
+            print(f"[플리] {attempt}차 목록 추출 실패:", repr(e), flush=True)
+            await asyncio.sleep(min(2 * attempt, 6))
+    raise last_err if last_err else Exception("플레이리스트 목록을 못 가져왔어.")
+
+
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==============================
-# ✅ 슬래시 커맨드 공통 권한 체크(통일)
+# ✅ 슬래시 커맨드 공통 권한 체크 + BUSY 체크
 # ==============================
 def require_user_in_voice(interaction: discord.Interaction) -> discord.VoiceChannel:
-    """
-    입력: interaction
-    출력: user voice channel
-    조건: 사용자는 반드시 어떤 통화방이든 들어가 있어야 함
-    """
     if not interaction.guild:
         raise Exception("길드(서버)에서만 쓸 수 있어.")
     if not isinstance(interaction.user, discord.Member):
@@ -228,14 +278,6 @@ def require_user_in_voice(interaction: discord.Interaction) -> discord.VoiceChan
 
 
 def require_user_in_bot_voice(interaction: discord.Interaction) -> discord.VoiceClient:
-    """
-    입력: interaction
-    출력: voice client
-    조건:
-      - 봇이 통화방에 있어야 함
-      - 사용자가 통화방에 있어야 함
-      - 사용자의 통화방 == 봇의 통화방
-    """
     if not interaction.guild:
         raise Exception("길드(서버)에서만 쓸 수 있어.")
 
@@ -248,6 +290,21 @@ def require_user_in_bot_voice(interaction: discord.Interaction) -> discord.Voice
         raise Exception(MSG_NEED_SAME_VOICE)
 
     return vc
+
+
+async def require_not_busy(interaction: discord.Interaction, allow_leave: bool = False):
+    """
+    정책:
+      - 플레이리스트 처리 중에는 대부분의 명령/버튼을 잠시 막음
+      - 단, allow_leave=True면 /퇴장 또는 퇴장 버튼은 허용
+    """
+    if not interaction.guild:
+        return
+    music = get_music(interaction.guild.id)
+    async with music.lock:
+        busy = music.is_busy
+    if busy and not allow_leave:
+        raise Exception(MSG_BUSY)
 
 
 # ==============================
@@ -282,11 +339,12 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
     embed = discord.Embed(title="곽덕춘")
 
     requester_name = _requester_name(guild, now.requester) if now else "-"
+    busy_text = " | 🔧 플리 처리중" if music.is_busy else ""
 
     embed.add_field(
         name="",
         value=(
-            f"상태: {status} | 요청자: {requester_name} | 음성 채널: {channel_name}\n"
+            f"상태: {status} | 요청자: {requester_name} | 음성 채널: {channel_name}{busy_text}\n"
             f"{repeat_label(music.repeat_mode)}"
         ),
         inline=False,
@@ -391,8 +449,6 @@ class MusicControlView(discord.ui.View):
     버튼 배치:
       1행: 일시정지 / 재생 / 셔플
       2행: 반복 / 스킵 / 목록 / 퇴장
-    반복 버튼 색상:
-      off=회색, all=초록, one=파랑
     """
     def __init__(self, repeat_mode: str = "off"):
         super().__init__(timeout=None)
@@ -423,6 +479,12 @@ class MusicControlView(discord.ui.View):
 
     @discord.ui.button(label="일시정지", style=discord.ButtonStyle.secondary, emoji="⏸️", row=0, custom_id="music_pause")
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await require_not_busy(interaction)
+        except Exception as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
         music = get_music(interaction.guild.id)
         touch_command(music)
 
@@ -435,6 +497,12 @@ class MusicControlView(discord.ui.View):
 
     @discord.ui.button(label="재생", style=discord.ButtonStyle.success, emoji="▶️", row=0, custom_id="music_resume")
     async def resume_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await require_not_busy(interaction)
+        except Exception as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
         music = get_music(interaction.guild.id)
         touch_command(music)
 
@@ -447,6 +515,12 @@ class MusicControlView(discord.ui.View):
 
     @discord.ui.button(label="셔플", style=discord.ButtonStyle.primary, emoji="🔀", row=0, custom_id="music_shuffle_once")
     async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await require_not_busy(interaction)
+        except Exception as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
         music = get_music(interaction.guild.id)
         touch_command(music)
 
@@ -459,6 +533,12 @@ class MusicControlView(discord.ui.View):
 
     @discord.ui.button(label="반복", style=discord.ButtonStyle.secondary, emoji="🔁", row=1, custom_id="music_repeat_cycle")
     async def repeat_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await require_not_busy(interaction)
+        except Exception as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
         music = get_music(interaction.guild.id)
         touch_command(music)
 
@@ -476,6 +556,12 @@ class MusicControlView(discord.ui.View):
 
     @discord.ui.button(label="스킵", style=discord.ButtonStyle.danger, emoji="⏭️", row=1, custom_id="music_skip")
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await require_not_busy(interaction)
+        except Exception as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
         music = get_music(interaction.guild.id)
         touch_command(music)
 
@@ -492,6 +578,12 @@ class MusicControlView(discord.ui.View):
 
     @discord.ui.button(label="목록", style=discord.ButtonStyle.secondary, emoji="📃", row=1, custom_id="music_list")
     async def list_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            await require_not_busy(interaction)
+        except Exception as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
         music = get_music(interaction.guild.id)
         touch_command(music)
 
@@ -511,6 +603,13 @@ class MusicControlView(discord.ui.View):
 
     @discord.ui.button(label="퇴장", style=discord.ButtonStyle.danger, emoji="🚪", row=1, custom_id="music_leave")
     async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # ✅ 플리 처리 중이어도 "퇴장"만 허용 + 플리 작업 즉시 중단
+        try:
+            await require_not_busy(interaction, allow_leave=True)
+        except Exception as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+
         music = get_music(interaction.guild.id)
         touch_command(music)
 
@@ -543,10 +642,19 @@ async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient
 async def do_leave(guild: discord.Guild, music: GuildMusic):
     """
     출력: 재생 중지 + 큐 초기화 + 음성 해제 + 태스크 정리 + 패널 삭제
+    + ✅ 플리 작업 즉시 중단(취소)
     """
     current = asyncio.current_task()
     vc = guild.voice_client
 
+    # ✅ 플리 작업 즉시 취소
+    playlist_task = None
+    async with music.lock:
+        playlist_task = music.playlist_task
+    if playlist_task and not playlist_task.done() and playlist_task is not current:
+        playlist_task.cancel()
+
+    # 재생 중이면 중지
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
 
@@ -554,21 +662,24 @@ async def do_leave(guild: discord.Guild, music: GuildMusic):
         music.queue.clear()
         music.now_playing = None
         music.skip_flag = False
+        music.is_busy = False
+        music.playlist_task = None
 
+    # 음성 채널 연결 해제
     try:
         if vc and vc.is_connected():
             await vc.disconnect()
     except Exception:
         pass
 
-    # ✅ 자기 자신은 취소하지 않음
+    # 태스크 정리(자기 자신은 취소하지 않음)
     if music.player_task and not music.player_task.done() and music.player_task is not current:
         music.player_task.cancel()
 
     if music.idle_task and not music.idle_task.done() and music.idle_task is not current:
         music.idle_task.cancel()
 
-    # ✅ 자동퇴장 시 패널 삭제가 끊기지 않게 보호
+    # 패널 삭제는 취소 영향 받지 않게 보호
     try:
         await asyncio.shield(delete_panel(guild, music))
     except Exception:
@@ -587,11 +698,9 @@ async def idle_watcher(guild: discord.Guild, music: GuildMusic):
             if not vc or not vc.is_connected():
                 return
 
-            # 재생/일시정지 중이면 유휴 아님
             if vc.is_playing() or vc.is_paused():
                 continue
 
-            # 아무것도 재생중이 아닐 때만 카운트
             async with music.lock:
                 has_queue = bool(music.queue)
                 has_now = (music.now_playing is not None)
@@ -617,6 +726,17 @@ def ensure_idle_task(guild: discord.Guild, music: GuildMusic):
 
 
 # ==============================
+# ✅ 재생 직전 지연 추출
+# ==============================
+async def ensure_stream_ready(track: Track) -> Track:
+    if track.stream_url:
+        return track
+    new = await extract_with_retry_single(track.url)
+    new.requester = track.requester
+    return new
+
+
+# ==============================
 # 재생 루프
 # ==============================
 async def player_loop(guild: discord.Guild, music: GuildMusic):
@@ -627,14 +747,12 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
             if not music.queue:
                 music.now_playing = None
 
-        # 큐 대기
         while True:
             async with music.lock:
                 if music.queue:
                     break
             await asyncio.sleep(0.5)
 
-        # 다음 곡
         async with music.lock:
             track = music.queue.popleft()
             music.now_playing = track
@@ -642,6 +760,15 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
         vc = guild.voice_client
         if not vc or not vc.is_connected():
             return
+
+        try:
+            track = await ensure_stream_ready(track)
+            async with music.lock:
+                music.now_playing = track
+        except Exception as e:
+            print("재생 직전 추출 실패:", repr(e), flush=True)
+            bot.loop.call_soon_threadsafe(music.next_event.set)
+            continue
 
         source = discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS)
 
@@ -661,7 +788,6 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
 
         await music.next_event.wait()
 
-        # 곡 종료 후 반복 처리 + 유휴 타이머 기준점(재생이 완전히 끝난 시점)
         async with music.lock:
             was_skip = music.skip_flag
             music.skip_flag = False
@@ -671,7 +797,6 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
             elif (not was_skip) and music.repeat_mode == "one":
                 music.queue.appendleft(track)
 
-            # 재생이 끝나서 "아무것도 없어진 시점"부터 5분 카운트
             if not music.queue:
                 music.now_playing = None
                 touch_command(music)
@@ -685,8 +810,6 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
 @bot.event
 async def on_ready():
     bootlog.info("READY_HIT: %s", bot.user)
-
-    # ✅ Persistent View 등록
     bot.add_view(MusicControlView())
 
     try:
@@ -712,22 +835,87 @@ async def play(interaction: discord.Interaction, 제목: str):
     await interaction.response.defer(thinking=True)
 
     try:
-        # ✅ 첫 /재생: 어느 통화방이든 들어가 있어야 함
+        # ✅ 어떤 경우든: 통화방에 들어가 있어야 사용 가능
         require_user_in_voice(interaction)
 
-        # ✅ 봇이 이미 다른 채널에 있으면 여기서 차단됨
+        # ✅ 플리 처리중이면 /재생도 막기(잠깐만)
+        await require_not_busy(interaction)
+
+        # ✅ 봇 연결 (이미 다른 통화방이면 차단)
         await connect_voice(interaction)
 
         music = get_music(interaction.guild.id)
         touch_command(music)
-        music.last_text_channel_id = interaction.channel_id
 
+        # 패널은 명령 친 채팅에 생성/유지
         music.panel_channel_id = interaction.channel_id
         ensure_idle_task(interaction.guild, music)
-
         await upsert_panel(interaction.guild, music)
 
-        track = await extract_with_retry(제목)
+        # ✅ 플레이리스트 자동 인식
+        if is_youtube_playlist_input(제목):
+            # ✅ 플리 처리 중에는 다른 명령 전부 잠금(퇴장만 예외)
+            async with music.busy_lock:
+                # 중복 플리 요청 방지
+                async with music.lock:
+                    if music.is_busy:
+                        raise Exception(MSG_BUSY)
+                    music.is_busy = True
+                    music.playlist_task = asyncio.current_task()
+
+                await upsert_panel(interaction.guild, music)
+
+                try:
+                    pairs = await extract_with_retry_playlist_flat(제목, PLAYLIST_LIMIT)
+                    if not pairs:
+                        raise Exception("플레이리스트에서 곡을 못 찾았어.")
+
+                    requester_id = interaction.user.id
+
+                    # ✅ 큐에 100곡 제한으로 적재(stream_url=None -> 재생 직전 추출)
+                    async with music.lock:
+                        for (t, u) in pairs:
+                            music.queue.append(
+                                Track(
+                                    title=t,
+                                    url=u,
+                                    stream_url=None,
+                                    requester=requester_id,
+                                    duration=None,
+                                    thumbnail=None,
+                                )
+                            )
+                        queue_size = len(music.queue)
+
+                    if not music.player_task or music.player_task.done():
+                        music.player_task = asyncio.create_task(player_loop(interaction.guild, music))
+
+                    await upsert_panel(interaction.guild, music)
+
+                    msg = await interaction.followup.send(
+                        f"📃 플레이리스트에서 **{len(pairs)}곡** 추가했어. (최대 {PLAYLIST_LIMIT}곡 제한)\n"
+                        f"현재 대기열 크기: {queue_size}",
+                        suppress_embeds=True
+                    )
+                    await asyncio.sleep(2)
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        pass
+
+                except asyncio.CancelledError:
+                    # ✅ 퇴장으로 플리 작업이 즉시 중단된 경우
+                    raise
+                finally:
+                    async with music.lock:
+                        music.is_busy = False
+                        music.playlist_task = None
+                    await upsert_panel(interaction.guild, music)
+
+            return
+
+        # ✅ 단일곡 처리
+        track = await extract_with_retry_single(제목)
         track.requester = interaction.user.id
 
         async with music.lock:
@@ -749,6 +937,9 @@ async def play(interaction: discord.Interaction, 제목: str):
         except Exception:
             pass
 
+    except asyncio.CancelledError:
+        # ✅ 플리 처리중 퇴장으로 /재생 작업 자체가 끊긴 경우: 추가 응답 없이 종료
+        return
     except Exception as e:
         await interaction.followup.send(str(e))
 
@@ -759,21 +950,21 @@ async def priority_play(interaction: discord.Interaction, 제목: str):
     await interaction.response.defer(thinking=True)
 
     try:
-        # ✅ 봇이 이미 있으면 같은 통화방이어야 함
-        # (없으면 첫 /재생과 동일하게 어디든 들어가 있으면 연결됨)
         require_user_in_voice(interaction)
+        await require_not_busy(interaction)
         await connect_voice(interaction)
 
         music = get_music(interaction.guild.id)
         touch_command(music)
-        music.last_text_channel_id = interaction.channel_id
 
         music.panel_channel_id = interaction.channel_id
         ensure_idle_task(interaction.guild, music)
-
         await upsert_panel(interaction.guild, music)
 
-        track = await extract_with_retry(제목)
+        if is_youtube_playlist_input(제목):
+            raise Exception("플레이리스트는 우선예약 말고 /재생으로 넣어줘.")
+
+        track = await extract_with_retry_single(제목)
         track.requester = interaction.user.id
 
         async with music.lock:
@@ -803,11 +994,11 @@ async def shuffle_cmd(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
     try:
+        await require_not_busy(interaction)
         require_user_in_bot_voice(interaction)
 
         music = get_music(interaction.guild.id)
         touch_command(music)
-        music.last_text_channel_id = interaction.channel_id
         ensure_idle_task(interaction.guild, music)
 
         async with music.lock:
@@ -829,11 +1020,11 @@ async def repeat_cmd(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
     try:
+        await require_not_busy(interaction)
         require_user_in_bot_voice(interaction)
 
         music = get_music(interaction.guild.id)
         touch_command(music)
-        music.last_text_channel_id = interaction.channel_id
         ensure_idle_task(interaction.guild, music)
 
         async with music.lock:
@@ -857,11 +1048,11 @@ async def skip(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
     try:
+        await require_not_busy(interaction)
         vc = require_user_in_bot_voice(interaction)
 
         music = get_music(interaction.guild.id)
         touch_command(music)
-        music.last_text_channel_id = interaction.channel_id
         ensure_idle_task(interaction.guild, music)
 
         if not (vc.is_playing() or vc.is_paused()):
@@ -885,11 +1076,12 @@ async def leave(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
     try:
+        # ✅ 플리 처리 중이어도 퇴장은 허용 + 플리 작업 즉시 중단
+        await require_not_busy(interaction, allow_leave=True)
         require_user_in_bot_voice(interaction)
 
         music = get_music(interaction.guild.id)
         touch_command(music)
-        music.last_text_channel_id = interaction.channel_id
 
         await do_leave(interaction.guild, music)
         await interaction.followup.send("응.")
@@ -903,11 +1095,11 @@ async def queue_list(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
     try:
+        await require_not_busy(interaction)
         require_user_in_bot_voice(interaction)
 
         music = get_music(interaction.guild.id)
         touch_command(music)
-        music.last_text_channel_id = interaction.channel_id
         ensure_idle_task(interaction.guild, music)
 
         async with music.lock:
@@ -920,7 +1112,6 @@ async def queue_list(interaction: discord.Interaction):
             more = len(music.queue) - len(items)
             if more > 0:
                 lines.append(f"...그리고 {more}개 더 있어.")
-
             msg = "📃 대기열 목록\n" + "\n\n".join(lines)
 
         await upsert_panel(interaction.guild, music)
@@ -936,6 +1127,7 @@ async def queue_remove(interaction: discord.Interaction, 번호: int):
     await interaction.response.defer(thinking=True)
 
     try:
+        await require_not_busy(interaction)
         require_user_in_bot_voice(interaction)
 
         if 번호 <= 0:
@@ -944,7 +1136,6 @@ async def queue_remove(interaction: discord.Interaction, 번호: int):
 
         music = get_music(interaction.guild.id)
         touch_command(music)
-        music.last_text_channel_id = interaction.channel_id
         ensure_idle_task(interaction.guild, music)
 
         async with music.lock:
