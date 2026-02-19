@@ -218,7 +218,7 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
     embed = discord.Embed(title="곽덕춘")
 
     # ==========================
-    # 상태 줄
+    # 상태 줄 (일반 굵기)
     # ==========================
     requester_name = _requester_name(guild, now.requester) if now else "-"
 
@@ -228,50 +228,39 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
         inline=False,
     )
 
-    # 🔽 여백 추가
+    # 🔽 여백(줄간격)
     embed.add_field(name="\u200b", value="\u200b", inline=False)
 
     # ==========================
-    # 현재 재생중
+    # 현재 재생중 (이 부분만 굵게)
     # ==========================
     if now:
         duration = fmt_time(now.duration)
-
         embed.add_field(
             name="현재 재생중",
             value=f"🎵 **{now.title} ({duration})**",
             inline=False,
         )
 
+        # ✅ 썸네일(오른쪽) 대신 하단 큰 이미지
         if now.thumbnail:
-            embed.set_thumbnail(url=now.thumbnail)
+            embed.set_image(url=now.thumbnail)
     else:
-        embed.add_field(
-            name="현재 재생중",
-            value="없음",
-            inline=False,
-        )
+        embed.add_field(name="현재 재생중", value="없음", inline=False)
 
-    # 🔽 여백 추가
+    # 🔽 여백(줄간격)
     embed.add_field(name="\u200b", value="\u200b", inline=False)
 
     # ==========================
-    # 다음 노래
+    # 다음 노래 (일반 굵기)
     # ==========================
     if next_track:
-        embed.add_field(
-            name="다음 노래",
-            value=f"{next_track.title}",
-            inline=False,
-        )
+        embed.add_field(name="다음 노래", value=f"{next_track.title}", inline=False)
     else:
-        embed.add_field(
-            name="다음 노래",
-            value="없음",
-            inline=False,
-        )
+        embed.add_field(name="다음 노래", value="없음", inline=False)
 
     return embed
+
 
 
 
@@ -774,6 +763,7 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
 
 
 
