@@ -214,51 +214,38 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
     channel_name = vc.channel.name if (vc and vc.is_connected() and vc.channel) else "-"
 
     now = music.now_playing
-    next_track = None
+    next_track = music.queue[0] if music.queue else None
 
-    if music.queue:
-        next_track = music.queue[0]
+    embed = discord.Embed(title="곽덕춘")
 
-    # ======================
-    # 현재 재생중
-    # ======================
+    # ✅ 현재 재생중: 가독성(위/아래 여백) + 기존 형태 유지
     if now:
-        req_name = _requester_name(guild, now.requester)
         dur = fmt_time(now.duration)
 
-        now_line = (
-            f"🎵 **{now.title}**\n\n"
-            f"👤 요청자: {req_name}\n"
-            f"⏱ 길이: `{dur}`\n"
-            f"{now.url}"
-        )
-    else:
-        now_line = "없음"
+        # 위/아래 줄바꿈으로 "덩어리"를 만들어 눈에 들어오게
+        now_line = f"\n🎵 **{now.title}** ({dur})\n"
+        embed.add_field(name="현재 재생중", value=now_line, inline=False)
 
-    # ======================
-    # 다음 노래 1개만 표시
-    # ======================
+        # ✅ 썸네일: 오른쪽 작은 이미지
+        if now.thumbnail:
+            embed.set_thumbnail(url=now.thumbnail)
+
+        # ✅ 요청자/상태는 덜 눈에 띄게: Footer로 이동
+        req_name = _requester_name(guild, now.requester)
+        embed.set_footer(text=f"상태: {status} | 요청자: {req_name} | 통화방: {channel_name}")
+
+    else:
+        embed.add_field(name="현재 재생중", value="\n없음\n", inline=False)
+        embed.set_footer(text=f"상태: {status} | 통화방: {channel_name}")
+
+    # ✅ 다음 노래 1개만 표시(간단하게)
     if next_track:
-        next_line = f"**{next_track.title}**"
+        embed.add_field(name="다음 노래", value=f"{next_track.title}", inline=False)
     else:
-        next_line = "없음"
-
-    # ======================
-    # Embed 생성
-    # ======================
-    embed = discord.Embed(
-        title="곽덕춘",
-        description=f"**상태:** {status}\n통화방: **{channel_name}**",
-    )
-
-    embed.add_field(name="현재 재생중", value=now_line, inline=False)
-    embed.add_field(name="다음 노래", value=next_line, inline=False)
-
-    # ✅ 썸네일 크게 표시
-    if now and now.thumbnail:
-        embed.set_image(url=now.thumbnail)
+        embed.add_field(name="다음 노래", value="없음", inline=False)
 
     return embed
+
 
 
 
@@ -761,4 +748,5 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
 
