@@ -559,20 +559,27 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
         try:
             vc.play(source, after=after_play)
             print(f"[재생 시작] {track.title}", flush=True)
+
+            # ✅ 패널 갱신
             await upsert_panel(guild, music)
+
         except Exception as e:
             print("vc.play 에러:", repr(e), flush=True)
             bot.loop.call_soon_threadsafe(music.next_event.set)
             continue
 
+        # 곡 종료(또는 stop) 대기
         await music.next_event.wait()
 
-        # 마지막 곡 종료 후 타이머 갱신
+        # ✅ 곡 종료 처리: 다음 곡이 없으면 now_playing 비우기 + idle 타이머 갱신
         async with music.lock:
             if not music.queue:
+                music.now_playing = None
                 touch_command(music)
 
+        # ✅ 종료 후 패널 갱신 (여기서 '현재 재생중'이 남지 않음)
         await upsert_panel(guild, music)
+
 
 
 # ==============================
@@ -764,3 +771,4 @@ if __name__ == "__main__":
     if not TOKEN:
         raise RuntimeError("환경변수 TOKEN이 설정되어 있지 않아. (CMD: set TOKEN=토큰)")
     bot.run(TOKEN)
+
