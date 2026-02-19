@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-ARG CACHE_BUST=2
+ARG CACHE_BUST=1
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg curl unzip ca-certificates \
