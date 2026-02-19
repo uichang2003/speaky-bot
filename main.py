@@ -25,6 +25,14 @@ IDLE_TIMEOUT_SEC = 5 * 60
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 # ==============================
+# 문구(통일)
+# ==============================
+MSG_NEED_VOICE = "통화방에 들어와야 쓸 수 있어."
+MSG_BOT_NOT_IN_VOICE = "지금 봇이 통화방에 없어."
+MSG_NEED_SAME_VOICE = "봇이 있는 통화방에 들어와야 쓸 수 있어."
+MSG_DIFF_VOICE_IN_USE = "다른 통화방에서 날 쓰는 중이야."
+
+# ==============================
 # yt-dlp 설정 (✅ 쿠키 미사용)
 # ==============================
 YTDLP_OPTIONS = {
@@ -33,13 +41,11 @@ YTDLP_OPTIONS = {
     "quiet": True,
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
-
     "sleep_requests": 1,
     "sleep_interval": 1,
     "max_sleep_interval": 3,
     "retries": 3,
     "fragment_retries": 3,
-
     "http_headers": {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -47,9 +53,7 @@ YTDLP_OPTIONS = {
             "Chrome/122.0.0.0 Safari/537.36"
         )
     },
-
     "remote_components": ["ejs:github"],
-
     "extractor_args": {
         "youtube": {
             "player_client": ["android"]
@@ -100,7 +104,7 @@ class GuildMusic:
         # ✅ 반복 모드: "off" | "all" | "one"
         self.repeat_mode: str = "off"
 
-        # ✅ 스킵으로 끝난 곡은 반복 ALL에 다시 넣지 않기(원하던 UX 쪽)
+        # ✅ 스킵으로 끝난 곡은 ALL 반복에 다시 넣지 않기
         self.skip_flag: bool = False
 
 
@@ -171,7 +175,7 @@ def extract_info(query: str) -> Track:
 
     stream_url = info.get("url")
     if not stream_url:
-        raise Exception("스트림 URL을 가져오지 못했습니다.")
+        raise Exception("스트림 URL을 가져오지 못했어.")
 
     duration = info.get("duration")
     thumbnail = info.get("thumbnail")
@@ -204,6 +208,47 @@ async def extract_with_retry(query: str) -> Track:
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ==============================
+# ✅ 슬래시 커맨드 공통 권한 체크(통일)
+# ==============================
+def require_user_in_voice(interaction: discord.Interaction) -> discord.VoiceChannel:
+    """
+    입력: interaction
+    출력: user voice channel
+    조건: 사용자는 반드시 어떤 통화방이든 들어가 있어야 함
+    """
+    if not interaction.guild:
+        raise Exception("길드(서버)에서만 쓸 수 있어.")
+    if not isinstance(interaction.user, discord.Member):
+        raise Exception("사용자 정보를 못 가져왔어.")
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        raise Exception(MSG_NEED_VOICE)
+    return interaction.user.voice.channel
+
+
+def require_user_in_bot_voice(interaction: discord.Interaction) -> discord.VoiceClient:
+    """
+    입력: interaction
+    출력: voice client
+    조건:
+      - 봇이 통화방에 있어야 함
+      - 사용자가 통화방에 있어야 함
+      - 사용자의 통화방 == 봇의 통화방
+    """
+    if not interaction.guild:
+        raise Exception("길드(서버)에서만 쓸 수 있어.")
+
+    vc = interaction.guild.voice_client
+    if not vc or not vc.is_connected() or not vc.channel:
+        raise Exception(MSG_BOT_NOT_IN_VOICE)
+
+    user_ch = require_user_in_voice(interaction)
+    if user_ch.id != vc.channel.id:
+        raise Exception(MSG_NEED_SAME_VOICE)
+
+    return vc
+
 
 # ==============================
 # 패널(임베드+버튼) 유틸
@@ -272,10 +317,6 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
 
 
 async def fetch_panel_channel(guild: discord.Guild, music: GuildMusic):
-    """
-    입력: guild, music(panel_channel_id 필요)
-    출력: 채널 객체(메시지 send 가능, fetch_message 가능) 또는 None
-    """
     if not music.panel_channel_id:
         return None
 
@@ -294,10 +335,6 @@ async def fetch_panel_channel(guild: discord.Guild, music: GuildMusic):
 
 
 async def delete_panel(guild: discord.Guild, music: GuildMusic):
-    """
-    입력: guild, music(panel ids)
-    출력: 패널 메시지 삭제 + panel id 초기화
-    """
     if not music.panel_channel_id or not music.panel_message_id:
         music.panel_channel_id = None
         music.panel_message_id = None
@@ -367,7 +404,7 @@ class MusicControlView(discord.ui.View):
 
         vc = interaction.guild.voice_client
         if not vc or not vc.is_connected() or not vc.channel:
-            await interaction.response.send_message("지금 통화방에 없어.", ephemeral=True)
+            await interaction.response.send_message(MSG_BOT_NOT_IN_VOICE, ephemeral=True)
             return False
 
         if (
@@ -375,11 +412,11 @@ class MusicControlView(discord.ui.View):
             or not interaction.user.voice
             or not interaction.user.voice.channel
         ):
-            await interaction.response.send_message("통화방에 들어와야 조작할 수 있어.", ephemeral=True)
+            await interaction.response.send_message(MSG_NEED_VOICE, ephemeral=True)
             return False
 
         if interaction.user.voice.channel.id != vc.channel.id:
-            await interaction.response.send_message("봇이 있는 통화방에 참여중인 사람만 조작할 수 있어.", ephemeral=True)
+            await interaction.response.send_message(MSG_NEED_SAME_VOICE, ephemeral=True)
             return False
 
         return True
@@ -432,7 +469,6 @@ class MusicControlView(discord.ui.View):
                 music.repeat_mode = "one"
             else:
                 music.repeat_mode = "off"
-
             button.style = repeat_button_style(music.repeat_mode)
 
         await upsert_panel(interaction.guild, music)
@@ -444,7 +480,7 @@ class MusicControlView(discord.ui.View):
         touch_command(music)
 
         async with music.lock:
-            music.skip_flag = True  # ✅ 스킵 종료 표시
+            music.skip_flag = True
             music.now_playing = None
 
         vc = interaction.guild.voice_client
@@ -473,7 +509,6 @@ class MusicControlView(discord.ui.View):
         await upsert_panel(interaction.guild, music)
         await interaction.response.send_message("📃 대기열\n" + "\n".join(lines), ephemeral=True)
 
-    # ✅ 버튼 라벨 변경: 나가 -> 퇴장 (custom_id는 유지해도 됨)
     @discord.ui.button(label="퇴장", style=discord.ButtonStyle.danger, emoji="🚪", row=1, custom_id="music_leave")
     async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         music = get_music(interaction.guild.id)
@@ -488,18 +523,18 @@ class MusicControlView(discord.ui.View):
 # ==============================
 async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient:
     if not interaction.guild:
-        raise Exception("길드(서버)에서만 사용할 수 있습니다.")
+        raise Exception("길드(서버)에서만 쓸 수 있어.")
     if not interaction.user or not isinstance(interaction.user, discord.Member):
-        raise Exception("사용자 정보를 가져오지 못했습니다.")
+        raise Exception("사용자 정보를 못 가져왔어.")
     if not interaction.user.voice or not interaction.user.voice.channel:
-        raise Exception("음성채널 먼저 들어가.")
+        raise Exception(MSG_NEED_VOICE)
 
     channel = interaction.user.voice.channel
     vc = interaction.guild.voice_client
 
     if vc and vc.is_connected():
         if vc.channel and vc.channel.id != channel.id:
-            raise Exception("다른곳에서 날 사용중이야.")
+            raise Exception(MSG_DIFF_VOICE_IN_USE)
         return vc
 
     return await channel.connect()
@@ -507,7 +542,6 @@ async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient
 
 async def do_leave(guild: discord.Guild, music: GuildMusic):
     """
-    입력: guild, music
     출력: 재생 중지 + 큐 초기화 + 음성 해제 + 태스크 정리 + 패널 삭제
     """
     current = asyncio.current_task()
@@ -527,6 +561,7 @@ async def do_leave(guild: discord.Guild, music: GuildMusic):
     except Exception:
         pass
 
+    # ✅ 자기 자신은 취소하지 않음
     if music.player_task and not music.player_task.done() and music.player_task is not current:
         music.player_task.cancel()
 
@@ -556,7 +591,7 @@ async def idle_watcher(guild: discord.Guild, music: GuildMusic):
             if vc.is_playing() or vc.is_paused():
                 continue
 
-            # ✅ 아무것도 재생중이 아닐 때만 카운트
+            # 아무것도 재생중이 아닐 때만 카운트
             async with music.lock:
                 has_queue = bool(music.queue)
                 has_now = (music.now_playing is not None)
@@ -626,16 +661,14 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
 
         await music.next_event.wait()
 
-        # ✅ 곡 종료 후 반복 처리 + 5분 타이머 기준점(재생이 완전히 끝난 시점)
+        # 곡 종료 후 반복 처리 + 유휴 타이머 기준점(재생이 완전히 끝난 시점)
         async with music.lock:
             was_skip = music.skip_flag
             music.skip_flag = False
 
-            if music.repeat_mode == "all" and (not was_skip):
-                # 자연 종료일 때만 다시 뒤로(스킵은 제외)
+            if (not was_skip) and music.repeat_mode == "all":
                 music.queue.append(track)
-            elif music.repeat_mode == "one" and (not was_skip):
-                # 한곡 반복: 바로 다시 다음 곡으로 만들기 위해 맨 앞 삽입
+            elif (not was_skip) and music.repeat_mode == "one":
                 music.queue.appendleft(track)
 
             # 재생이 끝나서 "아무것도 없어진 시점"부터 5분 카운트
@@ -679,9 +712,13 @@ async def play(interaction: discord.Interaction, 제목: str):
     await interaction.response.defer(thinking=True)
 
     try:
-        await connect_voice(interaction)
-        music = get_music(interaction.guild.id)
+        # ✅ 첫 /재생: 어느 통화방이든 들어가 있어야 함
+        require_user_in_voice(interaction)
 
+        # ✅ 봇이 이미 다른 채널에 있으면 여기서 차단됨
+        await connect_voice(interaction)
+
+        music = get_music(interaction.guild.id)
         touch_command(music)
         music.last_text_channel_id = interaction.channel_id
 
@@ -713,19 +750,21 @@ async def play(interaction: discord.Interaction, 제목: str):
             pass
 
     except Exception as e:
-        await interaction.followup.send(f"추출/재생 실패: {type(e).__name__}: {e}")
+        await interaction.followup.send(str(e))
 
 
-# ✅ 신규: 우선예약 (다음 곡)
 @bot.tree.command(name="우선예약", description="유튜브 URL 또는 제목을 다음 곡(대기열 맨 앞)으로 예약")
 @app_commands.describe(제목="URL 또는 제목 입력")
 async def priority_play(interaction: discord.Interaction, 제목: str):
     await interaction.response.defer(thinking=True)
 
     try:
+        # ✅ 봇이 이미 있으면 같은 통화방이어야 함
+        # (없으면 첫 /재생과 동일하게 어디든 들어가 있으면 연결됨)
+        require_user_in_voice(interaction)
         await connect_voice(interaction)
-        music = get_music(interaction.guild.id)
 
+        music = get_music(interaction.guild.id)
         touch_command(music)
         music.last_text_channel_id = interaction.channel_id
 
@@ -738,8 +777,7 @@ async def priority_play(interaction: discord.Interaction, 제목: str):
         track.requester = interaction.user.id
 
         async with music.lock:
-            music.queue.appendleft(track)  # ✅ 다음 곡
-            position = 1
+            music.queue.appendleft(track)
 
         if not music.player_task or music.player_task.done():
             music.player_task = asyncio.create_task(player_loop(interaction.guild, music))
@@ -757,137 +795,139 @@ async def priority_play(interaction: discord.Interaction, 제목: str):
             pass
 
     except Exception as e:
-        await interaction.followup.send(f"우선예약 실패: {type(e).__name__}: {e}")
+        await interaction.followup.send(str(e))
 
 
 @bot.tree.command(name="셔플", description="대기열을 1회 섞기(현재 재생중인 곡은 유지)")
 async def shuffle_cmd(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
-    if not interaction.guild:
-        await interaction.followup.send("길드(서버)에서만 사용할 수 있습니다.")
-        return
+    try:
+        require_user_in_bot_voice(interaction)
 
-    music = get_music(interaction.guild.id)
-    touch_command(music)
-    music.last_text_channel_id = interaction.channel_id
-    ensure_idle_task(interaction.guild, music)
+        music = get_music(interaction.guild.id)
+        touch_command(music)
+        music.last_text_channel_id = interaction.channel_id
+        ensure_idle_task(interaction.guild, music)
 
-    async with music.lock:
-        if len(music.queue) < 2:
-            ok = False
-        else:
-            shuffle_queue_inplace(music)
-            ok = True
+        async with music.lock:
+            if len(music.queue) < 2:
+                ok = False
+            else:
+                shuffle_queue_inplace(music)
+                ok = True
 
-    await upsert_panel(interaction.guild, music)
-    await interaction.followup.send("🔀 대기열을 섞었어." if ok else "대기열이 2개 이상 있어야 섞을 수 있어.")
+        await upsert_panel(interaction.guild, music)
+        await interaction.followup.send("🔀 대기열을 섞었어." if ok else "대기열이 2개 이상 있어야 섞을 수 있어.")
+
+    except Exception as e:
+        await interaction.followup.send(str(e))
 
 
 @bot.tree.command(name="반복", description="반복 모드 변경: OFF -> 전체 -> 한곡 -> OFF")
 async def repeat_cmd(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
-    if not interaction.guild:
-        await interaction.followup.send("길드(서버)에서만 사용할 수 있습니다.")
-        return
+    try:
+        require_user_in_bot_voice(interaction)
 
-    music = get_music(interaction.guild.id)
-    touch_command(music)
-    music.last_text_channel_id = interaction.channel_id
-    ensure_idle_task(interaction.guild, music)
+        music = get_music(interaction.guild.id)
+        touch_command(music)
+        music.last_text_channel_id = interaction.channel_id
+        ensure_idle_task(interaction.guild, music)
 
-    async with music.lock:
-        if music.repeat_mode == "off":
-            music.repeat_mode = "all"
-        elif music.repeat_mode == "all":
-            music.repeat_mode = "one"
-        else:
-            music.repeat_mode = "off"
+        async with music.lock:
+            if music.repeat_mode == "off":
+                music.repeat_mode = "all"
+            elif music.repeat_mode == "all":
+                music.repeat_mode = "one"
+            else:
+                music.repeat_mode = "off"
+            label = repeat_label(music.repeat_mode)
 
-        label = repeat_label(music.repeat_mode)
+        await upsert_panel(interaction.guild, music)
+        await interaction.followup.send(f"{label} 로 바꿨어.")
 
-    await upsert_panel(interaction.guild, music)
-    await interaction.followup.send(f"{label} 로 변경했어.")
+    except Exception as e:
+        await interaction.followup.send(str(e))
 
 
 @bot.tree.command(name="스킵", description="현재 곡만 스킵하고 다음 곡 재생")
 async def skip(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
-    vc = interaction.guild.voice_client if interaction.guild else None
-    if not vc or not vc.is_connected():
-        await interaction.followup.send("음성 채널에 없어.")
-        return
+    try:
+        vc = require_user_in_bot_voice(interaction)
 
-    music = get_music(interaction.guild.id)
-    touch_command(music)
-    music.last_text_channel_id = interaction.channel_id
-    ensure_idle_task(interaction.guild, music)
+        music = get_music(interaction.guild.id)
+        touch_command(music)
+        music.last_text_channel_id = interaction.channel_id
+        ensure_idle_task(interaction.guild, music)
 
-    if not (vc.is_playing() or vc.is_paused()):
-        await interaction.followup.send("재생중인 음악이 없어.")
-        return
+        if not (vc.is_playing() or vc.is_paused()):
+            await interaction.followup.send("재생중인 음악이 없어.")
+            return
 
-    async with music.lock:
-        music.skip_flag = True
-        music.now_playing = None
+        async with music.lock:
+            music.skip_flag = True
+            music.now_playing = None
 
-    vc.stop()
-    await upsert_panel(interaction.guild, music)
-    await interaction.followup.send("⏭️ 다음꺼야.")
+        vc.stop()
+        await upsert_panel(interaction.guild, music)
+        await interaction.followup.send("⏭️ 다음꺼야.")
+
+    except Exception as e:
+        await interaction.followup.send(str(e))
 
 
-# ✅ 변경: /나가 -> /퇴장
 @bot.tree.command(name="퇴장", description="음악 종료 + 대기열 비움 + 봇 퇴장")
 async def leave(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
-    if not interaction.guild:
-        await interaction.followup.send("길드(서버)에서만 사용할 수 있습니다.")
-        return
+    try:
+        require_user_in_bot_voice(interaction)
 
-    vc = interaction.guild.voice_client
-    if not vc or not vc.is_connected():
-        await interaction.followup.send("채널부터 들어가.")
-        return
+        music = get_music(interaction.guild.id)
+        touch_command(music)
+        music.last_text_channel_id = interaction.channel_id
 
-    music = get_music(interaction.guild.id)
-    touch_command(music)
-    music.last_text_channel_id = interaction.channel_id
+        await do_leave(interaction.guild, music)
+        await interaction.followup.send("응.")
 
-    await do_leave(interaction.guild, music)
-    await interaction.followup.send("응.")
+    except Exception as e:
+        await interaction.followup.send(str(e))
 
 
 @bot.tree.command(name="목록", description="현재 예약(대기열)된 노래 목록 확인")
 async def queue_list(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
-    if not interaction.guild:
-        await interaction.followup.send("길드(서버)에서만 사용할 수 있습니다.")
-        return
+    try:
+        require_user_in_bot_voice(interaction)
 
-    music = get_music(interaction.guild.id)
-    touch_command(music)
-    music.last_text_channel_id = interaction.channel_id
-    ensure_idle_task(interaction.guild, music)
+        music = get_music(interaction.guild.id)
+        touch_command(music)
+        music.last_text_channel_id = interaction.channel_id
+        ensure_idle_task(interaction.guild, music)
 
-    async with music.lock:
-        if not music.queue:
-            await interaction.followup.send("대기열이 비어있어.")
-            return
+        async with music.lock:
+            if not music.queue:
+                await interaction.followup.send("대기열이 비어있어.")
+                return
 
-        items = list(music.queue)[:20]
-        lines = [f"{i}. **{t.title}**" for i, t in enumerate(items, start=1)]
-        more = len(music.queue) - len(items)
-        if more > 0:
-            lines.append(f"...그리고 {more}개 더 있어.")
+            items = list(music.queue)[:20]
+            lines = [f"{i}. **{t.title}**" for i, t in enumerate(items, start=1)]
+            more = len(music.queue) - len(items)
+            if more > 0:
+                lines.append(f"...그리고 {more}개 더 있어.")
 
-        msg = "📃 대기열 목록\n" + "\n\n".join(lines)
+            msg = "📃 대기열 목록\n" + "\n\n".join(lines)
 
-    await upsert_panel(interaction.guild, music)
-    await interaction.followup.send(msg)
+        await upsert_panel(interaction.guild, music)
+        await interaction.followup.send(msg)
+
+    except Exception as e:
+        await interaction.followup.send(str(e))
 
 
 @bot.tree.command(name="취소", description="대기열에서 특정 번호의 곡을 삭제(예약 취소)")
@@ -895,35 +935,37 @@ async def queue_list(interaction: discord.Interaction):
 async def queue_remove(interaction: discord.Interaction, 번호: int):
     await interaction.response.defer(thinking=True)
 
-    if not interaction.guild:
-        await interaction.followup.send("길드(서버)에서만 사용할 수 있습니다.")
-        return
+    try:
+        require_user_in_bot_voice(interaction)
 
-    if 번호 <= 0:
-        await interaction.followup.send("그 번호는 없어.")
-        return
-
-    music = get_music(interaction.guild.id)
-    touch_command(music)
-    music.last_text_channel_id = interaction.channel_id
-    ensure_idle_task(interaction.guild, music)
-
-    async with music.lock:
-        if not music.queue:
-            await interaction.followup.send("대기열이 비어있어.")
-            return
-
-        if 번호 > len(music.queue):
+        if 번호 <= 0:
             await interaction.followup.send("그 번호는 없어.")
             return
 
-        q_list = list(music.queue)
-        removed = q_list.pop(번호 - 1)
-        music.queue.clear()
-        music.queue.extend(q_list)
+        music = get_music(interaction.guild.id)
+        touch_command(music)
+        music.last_text_channel_id = interaction.channel_id
+        ensure_idle_task(interaction.guild, music)
 
-    await upsert_panel(interaction.guild, music)
-    await interaction.followup.send(f"✅ 취소됨: **{removed.title}**")
+        async with music.lock:
+            if not music.queue:
+                await interaction.followup.send("대기열이 비어있어.")
+                return
+
+            if 번호 > len(music.queue):
+                await interaction.followup.send("그 번호는 없어.")
+                return
+
+            q_list = list(music.queue)
+            removed = q_list.pop(번호 - 1)
+            music.queue.clear()
+            music.queue.extend(q_list)
+
+        await upsert_panel(interaction.guild, music)
+        await interaction.followup.send(f"✅ 취소됨: **{removed.title}**")
+
+    except Exception as e:
+        await interaction.followup.send(str(e))
 
 
 if __name__ == "__main__":
