@@ -38,9 +38,10 @@ MSG_BUSY = "지금 플레이리스트 처리중이야. 잠깐만."
 # ==============================
 # yt-dlp 설정 (✅ 쿠키 미사용)
 # ==============================
-# ✅ 오디오 우선으로 강제해서 itag=18(video/mp4) 같은 스트림을 덜 밟게 함
-# - webm(대개 opus) 우선 -> m4a 차선 -> 나머지 bestaudio
-YTDLP_FORMAT = "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best"
+# ✅ itag=18 같은 영상 스트림을 최대한 피하기 위해:
+#    - bestaudio만 선택하고, 오디오 전용(webm/opus, m4a) 우선
+#    - 마지막에 /best(영상 포함)로 내려가지 않게 함
+YTDLP_FORMAT = "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio"
 
 YTDLP_BASE_OPTIONS: Dict[str, Any] = {
     "format": YTDLP_FORMAT,
@@ -110,52 +111,65 @@ def build_ytdlp_options(
 # ==============================
 # FFmpeg 설정
 # ==============================
-# ✅ 핵심: ffmpeg가 googlevideo에 접근할 때 403이 나면,
-#        yt-dlp가 준 http_headers(User-Agent 등)를 ffmpeg에 -headers로 전달해야 함.
 FFMPEG_BEFORE_BASE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10"
 FFMPEG_OPTIONS_BASE = "-vn"
 
 
+def _ensure_min_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    """
+    입력값: headers(dict)
+    출력값: 최소 헤더 보강된 dict
+    """
+    h = dict(headers or {})
+    if "User-Agent" not in h:
+        h["User-Agent"] = YTDLP_BASE_OPTIONS["http_headers"]["User-Agent"]
+
+    # ✅ YouTube/CDN에서 종종 요구/참조하는 헤더들
+    h.setdefault("Accept", "*/*")
+    h.setdefault("Accept-Language", "en-US,en;q=0.9")
+    h.setdefault("Origin", "https://www.youtube.com")
+    h.setdefault("Referer", "https://www.youtube.com/")
+
+    return h
+
+
 def _headers_dict_to_ffmpeg(headers: Dict[str, str]) -> str:
     """
-    입력값: {"User-Agent": "...", "Accept": "..."} 등
-    출력값: FFmpeg -headers에 넣을 "Key: Value\r\nKey2: Value2\r\n" 문자열
+    입력값: {"User-Agent": "...", ...}
+    출력값: FFmpeg -headers에 넣을 '실제 CRLF' 포함 문자열
     """
-    # FFmpeg는 \r\n 줄바꿈을 기대하는 경우가 많음
     lines = []
     for k, v in headers.items():
         if v is None:
             continue
         lines.append(f"{k}: {v}")
-    return "\\r\\n".join(lines) + "\\r\\n"
+    # ✅ 중요: 실제 \r\n 이어야 함 (\\r\\n 아님)
+    return "\r\n".join(lines) + "\r\n"
 
 
 def build_ffmpeg_kwargs(track: "Track") -> Dict[str, str]:
     """
-    입력값: Track(가능하면 http_headers 포함)
+    입력값: Track(http_headers 가능)
     출력값: FFmpegPCMAudio에 넣을 kwargs(before_options/options)
     """
-    before = FFMPEG_BEFORE_BASE
-    opts = FFMPEG_OPTIONS_BASE
-
-    # ✅ 헤더/UA/리퍼러 전달(403 방지 핵심)
-    headers = dict(track.http_headers or {})
-    # 최소 보장(없으면 기본 User-Agent라도)
-    if "User-Agent" not in headers:
-        headers["User-Agent"] = YTDLP_BASE_OPTIONS["http_headers"]["User-Agent"]
-
+    headers = _ensure_min_headers(track.http_headers or {})
     header_str = _headers_dict_to_ffmpeg(headers)
+
+    before = FFMPEG_BEFORE_BASE
+
+    # ✅ -headers에 CRLF 포함 문자열 전달
+    #    큰따옴표로 감싸고, 내부 큰따옴표는 없도록 유지
     before += f' -headers "{header_str}"'
 
-    # user_agent / referer도 같이 주면 안정화되는 케이스가 많음
+    # ✅ 별도 옵션으로도 넣어주면 더 안정적인 경우가 있음
     ua = headers.get("User-Agent", "")
     if ua:
         before += f' -user_agent "{ua}"'
 
-    # Referer를 강제(특정 스트림에서 필요)
+    # ✅ referer는 별도로도 박아둠
     before += ' -referer "https://www.youtube.com/"'
 
-    return {"before_options": before, "options": opts}
+    return {"before_options": before, "options": FFMPEG_OPTIONS_BASE}
 
 
 # ==============================
@@ -165,7 +179,7 @@ def build_ffmpeg_kwargs(track: "Track") -> Dict[str, str]:
 class Track:
     title: str
     url: str
-    stream_url: Optional[str]  # ✅ 지연 추출 때문에 Optional
+    stream_url: Optional[str]
     requester: int
     duration: Optional[int] = None
     thumbnail: Optional[str] = None
@@ -184,17 +198,12 @@ class GuildMusic:
         self.last_command_ts: float = time.monotonic()
         self.idle_task: Optional[asyncio.Task] = None
 
-        # 패널
         self.panel_channel_id: Optional[int] = None
         self.panel_message_id: Optional[int] = None
 
-        # 반복 모드
         self.repeat_mode: str = "off"  # "off" | "all" | "one"
-
-        # 스킵 플래그(스킵 종료는 repeat에 재삽입 안 함)
         self.skip_flag: bool = False
 
-        # ✅ 플레이리스트 처리 중 잠금 + 취소용 태스크 핸들
         self.is_busy: bool = False
         self.busy_lock: asyncio.Lock = asyncio.Lock()
         self.playlist_task: Optional[asyncio.Task] = None
@@ -265,17 +274,7 @@ def is_youtube_playlist_input(q: str) -> bool:
 # ✅ yt-dlp 추출 (폴백 로테이션)
 # ==============================
 def _extract_info_with_fallback(query: str, *, flat_playlist: bool, noplaylist: bool) -> Any:
-    """
-    입력값:
-      - query: URL 또는 검색어
-      - flat_playlist: True면 플레이리스트 목록만
-      - noplaylist: 단일/플리 여부
-
-    출력값:
-      - yt-dlp info dict
-    """
     last_err: Optional[Exception] = None
-
     for (clients, missing_pot) in YTDLP_FALLBACKS:
         opts = build_ytdlp_options(
             noplaylist=noplaylist,
@@ -290,8 +289,63 @@ def _extract_info_with_fallback(query: str, *, flat_playlist: bool, noplaylist: 
         except Exception as e:
             last_err = e
             print(f"[ytdlp 폴백 실패] clients={clients} missing_pot={missing_pot} err={repr(e)}", flush=True)
-
     raise last_err if last_err else Exception("알 수 없는 추출 실패")
+
+
+def _pick_audio_only_format(info: Dict[str, Any]) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
+    """
+    입력값: yt-dlp info(dict)
+    출력값: (stream_url, http_headers)
+
+    규칙:
+      1) formats 중 vcodec == 'none' (오디오 전용) 우선
+      2) ext webm/opus 우선, 그 다음 m4a
+      3) 없으면 info['url'] fallback
+    """
+    headers = info.get("http_headers") or info.get("headers") or None
+    if headers and not isinstance(headers, dict):
+        headers = None
+
+    fmts = info.get("formats") or []
+    candidates = []
+    for f in fmts:
+        if not f:
+            continue
+        url = f.get("url")
+        if not url:
+            continue
+        vcodec = f.get("vcodec")
+        acodec = f.get("acodec")
+        if vcodec == "none" and acodec and acodec != "none":
+            candidates.append(f)
+
+    # 정렬: webm 우선, 다음 m4a, 그 외
+    def score(f: Dict[str, Any]) -> Tuple[int, int]:
+        ext = (f.get("ext") or "").lower()
+        acodec = (f.get("acodec") or "").lower()
+        # 작은 값이 우선
+        ext_rank = 0
+        if ext == "webm":
+            ext_rank = 0
+        elif ext == "m4a":
+            ext_rank = 1
+        else:
+            ext_rank = 2
+        # opus면 더 우선
+        codec_rank = 0 if "opus" in acodec else 1
+        return (ext_rank, codec_rank)
+
+    if candidates:
+        candidates.sort(key=score)
+        best = candidates[0]
+        # format마다 headers를 따로 줄 때가 있어 그것도 반영
+        h2 = best.get("http_headers") or best.get("headers") or headers
+        if h2 and not isinstance(h2, dict):
+            h2 = headers
+        return best.get("url"), (h2 if isinstance(h2, dict) else headers)
+
+    # fallback
+    return info.get("url"), (headers if isinstance(headers, dict) else None)
 
 
 def extract_single_track(query: str) -> Track:
@@ -307,14 +361,9 @@ def extract_single_track(query: str) -> Track:
     title = info.get("title", "Unknown Title")
     webpage_url = info.get("webpage_url", query)
 
-    stream_url = info.get("url")
+    stream_url, http_headers = _pick_audio_only_format(info)
     if not stream_url:
         raise Exception("스트림 URL을 못 가져왔어.")
-
-    # ✅ yt-dlp가 추출 결과에 포함시켜주는 http_headers가 있으면 재생에 사용
-    http_headers = info.get("http_headers") or info.get("headers") or None
-    if http_headers and not isinstance(http_headers, dict):
-        http_headers = None
 
     return Track(
         title=title,
@@ -412,11 +461,6 @@ def require_user_in_bot_voice(interaction: discord.Interaction) -> discord.Voice
 
 
 async def require_not_busy(interaction: discord.Interaction, allow_leave: bool = False):
-    """
-    정책:
-      - 플레이리스트 처리 중에는 대부분의 명령/버튼을 잠시 막음
-      - 단, allow_leave=True면 /퇴장 또는 퇴장 버튼은 허용
-    """
     if not interaction.guild:
         return
     music = get_music(interaction.guild.id)
@@ -564,11 +608,6 @@ async def upsert_panel(guild: discord.Guild, music: GuildMusic):
 # 버튼 UI (✅ Persistent)
 # ==============================
 class MusicControlView(discord.ui.View):
-    """
-    버튼 배치:
-      1행: 일시정지 / 재생 / 셔플
-      2행: 반복 / 스킵 / 목록 / 퇴장
-    """
     def __init__(self, repeat_mode: str = "off"):
         super().__init__(timeout=None)
         self.repeat_btn.style = repeat_button_style(repeat_mode)
@@ -758,10 +797,6 @@ async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient
 
 
 async def do_leave(guild: discord.Guild, music: GuildMusic):
-    """
-    출력: 재생 중지 + 큐 초기화 + 음성 해제 + 태스크 정리 + 패널 삭제
-    + ✅ 플리 작업 즉시 중단(취소)
-    """
     current = asyncio.current_task()
     vc = guild.voice_client
 
@@ -842,16 +877,7 @@ def ensure_idle_task(guild: discord.Guild, music: GuildMusic):
 # ✅ 재생 직전 지연 추출
 # ==============================
 async def ensure_stream_ready(track: Track) -> Track:
-    """
-    입력값: Track(stream_url이 없을 수 있음)
-    출력값: Track(stream_url + http_headers 확보)
-    """
-    if track.stream_url:
-        # stream_url은 있는데 headers가 비어있으면 한 번 더 추출해서 headers 보강(403 방지)
-        if not track.http_headers:
-            new = await extract_with_retry_single(track.url)
-            new.requester = track.requester
-            return new
+    if track.stream_url and track.http_headers:
         return track
 
     new = await extract_with_retry_single(track.url)
@@ -970,7 +996,6 @@ async def play(interaction: discord.Interaction, 제목: str):
         ensure_idle_task(interaction.guild, music)
         await upsert_panel(interaction.guild, music)
 
-        # ✅ 플레이리스트 자동 인식
         if is_youtube_playlist_input(제목):
             async with music.busy_lock:
                 async with music.lock:
@@ -1029,7 +1054,6 @@ async def play(interaction: discord.Interaction, 제목: str):
 
             return
 
-        # ✅ 단일곡 처리
         track = await extract_with_retry_single(제목)
         track.requester = interaction.user.id
 
