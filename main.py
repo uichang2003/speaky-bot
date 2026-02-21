@@ -4,7 +4,7 @@ import time
 import logging
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional, List, Tuple
+from typing import Deque, Dict, Optional, List, Tuple, Any
 
 import discord
 from discord import app_commands
@@ -38,7 +38,8 @@ MSG_BUSY = "지금 플레이리스트 처리중이야. 잠깐만."
 # ==============================
 # yt-dlp 설정 (✅ 쿠키 미사용)
 # ==============================
-YTDLP_OPTIONS_SINGLE = {
+# ✅ 공통 베이스 옵션 (여기서는 player_client를 고정하지 않음)
+YTDLP_BASE_OPTIONS: Dict[str, Any] = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
@@ -57,25 +58,64 @@ YTDLP_OPTIONS_SINGLE = {
         )
     },
     "remote_components": ["ejs:github"],
-    "extractor_args": {
-        "youtube": {"player_client": ["android"]}
-    },
 }
 
-# ✅ 플레이리스트 "목록만" 뽑는 옵션(스트림 URL 추출은 재생 직전)
-YTDLP_OPTIONS_PLAYLIST_FLAT = {
-    **YTDLP_OPTIONS_SINGLE,
-    "noplaylist": False,
-    "extract_flat": "in_playlist",
-    "skip_download": True,
-}
+# ✅ 폴백 로테이션:
+#  1) web (토큰 요구/정책 변화에 상대적으로 덜 흔들리는 편)
+#  2) ios
+#  3) web + missing_pot(스킵되는 포맷도 포함해서 마지막으로 한 번 더 시도)
+#
+#  * android는 PO Token 경고/403 리스크가 커서 기본 폴백에서 제외
+YTDLP_FALLBACKS: List[Tuple[List[str], bool]] = [
+    (["web"], False),
+    (["ios"], False),
+    (["web"], True),   # 마지막 폴백: missing_pot 포함
+]
+
+
+def build_ytdlp_options(*, noplaylist: bool, extract_flat: bool = False,
+                        player_clients: Optional[List[str]] = None,
+                        missing_pot: bool = False) -> Dict[str, Any]:
+    """
+    입력값:
+      - noplaylist: True/False
+      - extract_flat: 플레이리스트 '목록만' 뽑을 때 True
+      - player_clients: ["web"] 같은 형태
+      - missing_pot: True면 formats=missing_pot 적용(마지막 폴백용)
+
+    출력값:
+      - yt-dlp 옵션 dict
+    """
+    opts = dict(YTDLP_BASE_OPTIONS)
+    opts["noplaylist"] = noplaylist
+
+    if extract_flat:
+        opts["extract_flat"] = "in_playlist"
+        opts["skip_download"] = True
+
+    # extractor_args 구성
+    youtube_args: Dict[str, Any] = {}
+    if player_clients:
+        youtube_args["player_client"] = player_clients
+    if missing_pot:
+        # yt-dlp extractor arg: formats=missing_pot (스킵되던 포맷도 포함 시도)
+        youtube_args["formats"] = "missing_pot"
+
+    if youtube_args:
+        opts["extractor_args"] = {"youtube": youtube_args}
+
+    return opts
+
 
 # ==============================
 # FFmpeg 설정
 # ==============================
+# ✅ discord.py(FFmpegPCMAudio)가 PCM 변환을 위해 -ac/-ar를 내부적으로 포함하는 경우가 많아
+#    여기서 -ac/-ar를 또 넣으면 "Multiple -ac/-ar" 경고가 뜹니다.
+#    그래서 -ac/-ar 제거하고 재연결 옵션만 유지합니다.
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10",
-    "options": "-vn -ar 48000 -ac 2",
+    "options": "-vn",
 }
 
 # ==============================
@@ -179,13 +219,49 @@ def is_youtube_playlist_input(q: str) -> bool:
     return False
 
 
+# ==============================
+# ✅ yt-dlp 추출 (폴백 로테이션)
+# ==============================
+def _extract_info_with_fallback(query: str, *, flat_playlist: bool, noplaylist: bool,
+                               limit: int = PLAYLIST_LIMIT) -> Any:
+    """
+    입력값:
+      - query: URL 또는 검색어
+      - flat_playlist: True면 플레이리스트 목록만
+      - noplaylist: 단일/플리 여부
+      - limit: 플리 목록 최대
+
+    출력값:
+      - yt-dlp info dict (단일) 또는 (플리 flat) info dict
+    """
+    last_err: Optional[Exception] = None
+
+    for (clients, missing_pot) in YTDLP_FALLBACKS:
+        opts = build_ytdlp_options(
+            noplaylist=noplaylist,
+            extract_flat=flat_playlist,
+            player_clients=clients,
+            missing_pot=missing_pot,
+        )
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(query, download=False)
+            return info
+        except Exception as e:
+            last_err = e
+            print(f"[ytdlp 폴백 실패] clients={clients} missing_pot={missing_pot} err={repr(e)}", flush=True)
+            continue
+
+    raise last_err if last_err else Exception("알 수 없는 추출 실패")
+
+
 def extract_single_track(query: str) -> Track:
     """
     입력값: query(유튜브 URL 또는 검색어)
     출력값: Track(단일곡, stream_url 포함)
     """
-    with yt_dlp.YoutubeDL(YTDLP_OPTIONS_SINGLE) as ydl:
-        info = ydl.extract_info(query, download=False)
+    info = _extract_info_with_fallback(query, flat_playlist=False, noplaylist=True)
 
     if "entries" in info and info["entries"]:
         info = info["entries"][0]
@@ -212,8 +288,12 @@ def extract_playlist_flat(playlist_url: str, limit: int = PLAYLIST_LIMIT) -> Lis
     입력값: playlist_url, limit
     출력값: [(title, video_url), ...] 최대 limit개
     """
-    with yt_dlp.YoutubeDL(YTDLP_OPTIONS_PLAYLIST_FLAT) as ydl:
-        info = ydl.extract_info(playlist_url, download=False)
+    info = _extract_info_with_fallback(
+        playlist_url,
+        flat_playlist=True,
+        noplaylist=False,
+        limit=limit,
+    )
 
     entries = info.get("entries") or []
     out: List[Tuple[str, str]] = []
