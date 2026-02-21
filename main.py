@@ -4,7 +4,7 @@ import time
 import logging
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional, List, Tuple, Any
+from typing import Deque, Dict, Optional, List, Tuple
 
 import discord
 from discord import app_commands
@@ -26,6 +26,11 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 PLAYLIST_LIMIT = 100  # ✅ 플레이리스트 최대 추가 곡 수
 
+# ✅ 재생이 "즉시 실패"한 것으로 판단할 시간(초)
+EARLY_FAIL_SEC = 4.0
+# ✅ 즉시 실패 시 재추출/재시도 횟수(1회만)
+EARLY_FAIL_RETRY = 1
+
 # ==============================
 # 문구(통일)
 # ==============================
@@ -36,15 +41,10 @@ MSG_DIFF_VOICE_IN_USE = "다른 통화방에서 날 쓰는 중이야."
 MSG_BUSY = "지금 플레이리스트 처리중이야. 잠깐만."
 
 # ==============================
-# yt-dlp 설정 (✅ 쿠키 미사용)
+# yt-dlp 설정 (✅ 쿠키 미사용)  ← 처음 방식으로 복귀
 # ==============================
-# ✅ itag=18 같은 영상 스트림을 최대한 피하기 위해:
-#    - bestaudio만 선택하고, 오디오 전용(webm/opus, m4a) 우선
-#    - 마지막에 /best(영상 포함)로 내려가지 않게 함
-YTDLP_FORMAT = "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio"
-
-YTDLP_BASE_OPTIONS: Dict[str, Any] = {
-    "format": YTDLP_FORMAT,
+YTDLP_OPTIONS_SINGLE = {
+    "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "default_search": "ytsearch1",
@@ -62,115 +62,26 @@ YTDLP_BASE_OPTIONS: Dict[str, Any] = {
         )
     },
     "remote_components": ["ejs:github"],
+    "extractor_args": {
+        "youtube": {"player_client": ["android"]}
+    },
 }
 
-# ✅ 폴백 로테이션 (android는 PO Token 경고/403 리스크가 커서 기본에서 제외)
-YTDLP_FALLBACKS: List[Tuple[List[str], bool]] = [
-    (["web"], False),
-    (["ios"], False),
-    (["web"], True),  # 마지막: missing_pot 포함
-]
-
-
-def build_ytdlp_options(
-    *,
-    noplaylist: bool,
-    extract_flat: bool = False,
-    player_clients: Optional[List[str]] = None,
-    missing_pot: bool = False,
-) -> Dict[str, Any]:
-    """
-    입력값:
-      - noplaylist: True/False
-      - extract_flat: 플레이리스트 목록만 뽑을 때 True
-      - player_clients: ["web"] 같은 형태
-      - missing_pot: True면 formats=missing_pot 적용(마지막 폴백용)
-
-    출력값:
-      - yt-dlp 옵션 dict
-    """
-    opts = dict(YTDLP_BASE_OPTIONS)
-    opts["noplaylist"] = noplaylist
-
-    if extract_flat:
-        opts["extract_flat"] = "in_playlist"
-        opts["skip_download"] = True
-
-    youtube_args: Dict[str, Any] = {}
-    if player_clients:
-        youtube_args["player_client"] = player_clients
-    if missing_pot:
-        youtube_args["formats"] = "missing_pot"
-
-    if youtube_args:
-        opts["extractor_args"] = {"youtube": youtube_args}
-
-    return opts
-
+# ✅ 플레이리스트 "목록만" 뽑는 옵션(스트림 URL 추출은 재생 직전)
+YTDLP_OPTIONS_PLAYLIST_FLAT = {
+    **YTDLP_OPTIONS_SINGLE,
+    "noplaylist": False,
+    "extract_flat": "in_playlist",
+    "skip_download": True,
+}
 
 # ==============================
-# FFmpeg 설정
+# FFmpeg 설정 (원래 그대로)
 # ==============================
-FFMPEG_BEFORE_BASE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10"
-FFMPEG_OPTIONS_BASE = "-vn"
-
-
-def _ensure_min_headers(headers: Dict[str, str]) -> Dict[str, str]:
-    """
-    입력값: headers(dict)
-    출력값: 최소 헤더 보강된 dict
-    """
-    h = dict(headers or {})
-    if "User-Agent" not in h:
-        h["User-Agent"] = YTDLP_BASE_OPTIONS["http_headers"]["User-Agent"]
-
-    # ✅ YouTube/CDN에서 종종 요구/참조하는 헤더들
-    h.setdefault("Accept", "*/*")
-    h.setdefault("Accept-Language", "en-US,en;q=0.9")
-    h.setdefault("Origin", "https://www.youtube.com")
-    h.setdefault("Referer", "https://www.youtube.com/")
-
-    return h
-
-
-def _headers_dict_to_ffmpeg(headers: Dict[str, str]) -> str:
-    """
-    입력값: {"User-Agent": "...", ...}
-    출력값: FFmpeg -headers에 넣을 '실제 CRLF' 포함 문자열
-    """
-    lines = []
-    for k, v in headers.items():
-        if v is None:
-            continue
-        lines.append(f"{k}: {v}")
-    # ✅ 중요: 실제 \r\n 이어야 함 (\\r\\n 아님)
-    return "\r\n".join(lines) + "\r\n"
-
-
-def build_ffmpeg_kwargs(track: "Track") -> Dict[str, str]:
-    """
-    입력값: Track(http_headers 가능)
-    출력값: FFmpegPCMAudio에 넣을 kwargs(before_options/options)
-    """
-    headers = _ensure_min_headers(track.http_headers or {})
-    header_str = _headers_dict_to_ffmpeg(headers)
-
-    before = FFMPEG_BEFORE_BASE
-
-    # ✅ -headers에 CRLF 포함 문자열 전달
-    #    큰따옴표로 감싸고, 내부 큰따옴표는 없도록 유지
-    before += f' -headers "{header_str}"'
-
-    # ✅ 별도 옵션으로도 넣어주면 더 안정적인 경우가 있음
-    ua = headers.get("User-Agent", "")
-    if ua:
-        before += f' -user_agent "{ua}"'
-
-    # ✅ referer는 별도로도 박아둠
-    before += ' -referer "https://www.youtube.com/"'
-
-    return {"before_options": before, "options": FFMPEG_OPTIONS_BASE}
-
+FFMPEG_OPTIONS = {
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10",
+    "options": "-vn -ar 48000 -ac 2",
+}
 
 # ==============================
 # 데이터 구조
@@ -179,11 +90,10 @@ def build_ffmpeg_kwargs(track: "Track") -> Dict[str, str]:
 class Track:
     title: str
     url: str
-    stream_url: Optional[str]
+    stream_url: Optional[str]  # ✅ 지연 추출 때문에 Optional
     requester: int
     duration: Optional[int] = None
     thumbnail: Optional[str] = None
-    http_headers: Optional[Dict[str, str]] = None  # ✅ ffmpeg 403 방지용
 
 
 class GuildMusic:
@@ -198,12 +108,17 @@ class GuildMusic:
         self.last_command_ts: float = time.monotonic()
         self.idle_task: Optional[asyncio.Task] = None
 
+        # 패널
         self.panel_channel_id: Optional[int] = None
         self.panel_message_id: Optional[int] = None
 
+        # 반복 모드
         self.repeat_mode: str = "off"  # "off" | "all" | "one"
+
+        # 스킵 플래그(스킵 종료는 repeat에 재삽입 안 함)
         self.skip_flag: bool = False
 
+        # ✅ 플레이리스트 처리 중 잠금 + 취소용 태스크 핸들
         self.is_busy: bool = False
         self.busy_lock: asyncio.Lock = asyncio.Lock()
         self.playlist_task: Optional[asyncio.Task] = None
@@ -249,7 +164,6 @@ def repeat_button_style(mode: str) -> discord.ButtonStyle:
 
 def shuffle_queue_inplace(music: GuildMusic):
     import random
-
     q = list(music.queue)
     random.shuffle(q)
     music.queue.clear()
@@ -270,90 +184,13 @@ def is_youtube_playlist_input(q: str) -> bool:
     return False
 
 
-# ==============================
-# ✅ yt-dlp 추출 (폴백 로테이션)
-# ==============================
-def _extract_info_with_fallback(query: str, *, flat_playlist: bool, noplaylist: bool) -> Any:
-    last_err: Optional[Exception] = None
-    for (clients, missing_pot) in YTDLP_FALLBACKS:
-        opts = build_ytdlp_options(
-            noplaylist=noplaylist,
-            extract_flat=flat_playlist,
-            player_clients=clients,
-            missing_pot=missing_pot,
-        )
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(query, download=False)
-            return info
-        except Exception as e:
-            last_err = e
-            print(f"[ytdlp 폴백 실패] clients={clients} missing_pot={missing_pot} err={repr(e)}", flush=True)
-    raise last_err if last_err else Exception("알 수 없는 추출 실패")
-
-
-def _pick_audio_only_format(info: Dict[str, Any]) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
-    """
-    입력값: yt-dlp info(dict)
-    출력값: (stream_url, http_headers)
-
-    규칙:
-      1) formats 중 vcodec == 'none' (오디오 전용) 우선
-      2) ext webm/opus 우선, 그 다음 m4a
-      3) 없으면 info['url'] fallback
-    """
-    headers = info.get("http_headers") or info.get("headers") or None
-    if headers and not isinstance(headers, dict):
-        headers = None
-
-    fmts = info.get("formats") or []
-    candidates = []
-    for f in fmts:
-        if not f:
-            continue
-        url = f.get("url")
-        if not url:
-            continue
-        vcodec = f.get("vcodec")
-        acodec = f.get("acodec")
-        if vcodec == "none" and acodec and acodec != "none":
-            candidates.append(f)
-
-    # 정렬: webm 우선, 다음 m4a, 그 외
-    def score(f: Dict[str, Any]) -> Tuple[int, int]:
-        ext = (f.get("ext") or "").lower()
-        acodec = (f.get("acodec") or "").lower()
-        # 작은 값이 우선
-        ext_rank = 0
-        if ext == "webm":
-            ext_rank = 0
-        elif ext == "m4a":
-            ext_rank = 1
-        else:
-            ext_rank = 2
-        # opus면 더 우선
-        codec_rank = 0 if "opus" in acodec else 1
-        return (ext_rank, codec_rank)
-
-    if candidates:
-        candidates.sort(key=score)
-        best = candidates[0]
-        # format마다 headers를 따로 줄 때가 있어 그것도 반영
-        h2 = best.get("http_headers") or best.get("headers") or headers
-        if h2 and not isinstance(h2, dict):
-            h2 = headers
-        return best.get("url"), (h2 if isinstance(h2, dict) else headers)
-
-    # fallback
-    return info.get("url"), (headers if isinstance(headers, dict) else None)
-
-
 def extract_single_track(query: str) -> Track:
     """
     입력값: query(유튜브 URL 또는 검색어)
-    출력값: Track(단일곡, stream_url + http_headers 포함)
+    출력값: Track(단일곡, stream_url 포함)
     """
-    info = _extract_info_with_fallback(query, flat_playlist=False, noplaylist=True)
+    with yt_dlp.YoutubeDL(YTDLP_OPTIONS_SINGLE) as ydl:
+        info = ydl.extract_info(query, download=False)
 
     if "entries" in info and info["entries"]:
         info = info["entries"][0]
@@ -361,7 +198,7 @@ def extract_single_track(query: str) -> Track:
     title = info.get("title", "Unknown Title")
     webpage_url = info.get("webpage_url", query)
 
-    stream_url, http_headers = _pick_audio_only_format(info)
+    stream_url = info.get("url")
     if not stream_url:
         raise Exception("스트림 URL을 못 가져왔어.")
 
@@ -372,7 +209,6 @@ def extract_single_track(query: str) -> Track:
         requester=0,
         duration=info.get("duration"),
         thumbnail=info.get("thumbnail"),
-        http_headers=http_headers,
     )
 
 
@@ -381,7 +217,8 @@ def extract_playlist_flat(playlist_url: str, limit: int = PLAYLIST_LIMIT) -> Lis
     입력값: playlist_url, limit
     출력값: [(title, video_url), ...] 최대 limit개
     """
-    info = _extract_info_with_fallback(playlist_url, flat_playlist=True, noplaylist=False)
+    with yt_dlp.YoutubeDL(YTDLP_OPTIONS_PLAYLIST_FLAT) as ydl:
+        info = ydl.extract_info(playlist_url, download=False)
 
     entries = info.get("entries") or []
     out: List[Tuple[str, str]] = []
@@ -461,6 +298,11 @@ def require_user_in_bot_voice(interaction: discord.Interaction) -> discord.Voice
 
 
 async def require_not_busy(interaction: discord.Interaction, allow_leave: bool = False):
+    """
+    정책:
+      - 플레이리스트 처리 중에는 대부분의 명령/버튼을 잠시 막음
+      - 단, allow_leave=True면 /퇴장 또는 퇴장 버튼은 허용
+    """
     if not interaction.guild:
         return
     music = get_music(interaction.guild.id)
@@ -608,6 +450,11 @@ async def upsert_panel(guild: discord.Guild, music: GuildMusic):
 # 버튼 UI (✅ Persistent)
 # ==============================
 class MusicControlView(discord.ui.View):
+    """
+    버튼 배치:
+      1행: 일시정지 / 재생 / 셔플
+      2행: 반복 / 스킵 / 목록 / 퇴장
+    """
     def __init__(self, repeat_mode: str = "off"):
         super().__init__(timeout=None)
         self.repeat_btn.style = repeat_button_style(repeat_mode)
@@ -797,15 +644,21 @@ async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient
 
 
 async def do_leave(guild: discord.Guild, music: GuildMusic):
+    """
+    출력: 재생 중지 + 큐 초기화 + 음성 해제 + 태스크 정리 + 패널 삭제
+    + ✅ 플리 작업 즉시 중단(취소)
+    """
     current = asyncio.current_task()
     vc = guild.voice_client
 
+    # ✅ 플리 작업 즉시 취소
     playlist_task = None
     async with music.lock:
         playlist_task = music.playlist_task
     if playlist_task and not playlist_task.done() and playlist_task is not current:
         playlist_task.cancel()
 
+    # 재생 중이면 중지
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
 
@@ -816,18 +669,21 @@ async def do_leave(guild: discord.Guild, music: GuildMusic):
         music.is_busy = False
         music.playlist_task = None
 
+    # 음성 채널 연결 해제
     try:
         if vc and vc.is_connected():
             await vc.disconnect()
     except Exception:
         pass
 
+    # 태스크 정리(자기 자신은 취소하지 않음)
     if music.player_task and not music.player_task.done() and music.player_task is not current:
         music.player_task.cancel()
 
     if music.idle_task and not music.idle_task.done() and music.idle_task is not current:
         music.idle_task.cancel()
 
+    # 패널 삭제는 취소 영향 받지 않게 보호
     try:
         await asyncio.shield(delete_panel(guild, music))
     except Exception:
@@ -877,16 +733,15 @@ def ensure_idle_task(guild: discord.Guild, music: GuildMusic):
 # ✅ 재생 직전 지연 추출
 # ==============================
 async def ensure_stream_ready(track: Track) -> Track:
-    if track.stream_url and track.http_headers:
+    if track.stream_url:
         return track
-
     new = await extract_with_retry_single(track.url)
     new.requester = track.requester
     return new
 
 
 # ==============================
-# 재생 루프
+# 재생 루프 (✅ 즉시 실패 시 1회 재추출 후 재시도)
 # ==============================
 async def player_loop(guild: discord.Guild, music: GuildMusic):
     while True:
@@ -910,48 +765,87 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
         if not vc or not vc.is_connected():
             return
 
-        try:
-            track = await ensure_stream_ready(track)
+        # 재생 시도(즉시 실패면 1회만 재추출 후 재시도)
+        attempts_left = EARLY_FAIL_RETRY + 1  # 기본 1회 + 재시도 1회
+        while attempts_left > 0:
+            attempts_left -= 1
+
+            try:
+                track = await ensure_stream_ready(track)
+                async with music.lock:
+                    music.now_playing = track
+            except Exception as e:
+                print("재생 직전 추출 실패:", repr(e), flush=True)
+                bot.loop.call_soon_threadsafe(music.next_event.set)
+                break
+
+            start_ts = time.monotonic()
+
+            source = discord.FFmpegPCMAudio(track.stream_url, **FFMPEG_OPTIONS)
+
+            def after_play(error):
+                if error:
+                    print("재생 after 에러:", repr(error), flush=True)
+                bot.loop.call_soon_threadsafe(music.next_event.set)
+
+            try:
+                vc.play(source, after=after_play)
+                print(f"[재생 시작] {track.title}", flush=True)
+                await upsert_panel(guild, music)
+            except Exception as e:
+                print("vc.play 에러:", repr(e), flush=True)
+                bot.loop.call_soon_threadsafe(music.next_event.set)
+                break
+
+            await music.next_event.wait()
+            elapsed = time.monotonic() - start_ts
+
             async with music.lock:
-                music.now_playing = track
-        except Exception as e:
-            print("재생 직전 추출 실패:", repr(e), flush=True)
-            bot.loop.call_soon_threadsafe(music.next_event.set)
-            continue
+                was_skip = music.skip_flag
+                # skip_flag는 이번 트랙 종료 처리에서만 소비
+                music.skip_flag = False
 
-        ffmpeg_kwargs = build_ffmpeg_kwargs(track)
-        source = discord.FFmpegPCMAudio(track.stream_url, **ffmpeg_kwargs)
+            # ✅ 사용자가 스킵한 경우는 재시도하지 않음
+            if was_skip:
+                async with music.lock:
+                    music.now_playing = None
+                    touch_command(music)
+                await upsert_panel(guild, music)
+                break
 
-        def after_play(error):
-            if error:
-                print("재생 after 에러:", repr(error), flush=True)
-            bot.loop.call_soon_threadsafe(music.next_event.set)
+            # ✅ "즉시 실패"로 판단되면: stream_url 재추출 후 1회 재시도
+            if elapsed < EARLY_FAIL_SEC and attempts_left > 0:
+                print(f"즉시 실패로 판단({elapsed:.2f}s). 스트림 재추출 후 재시도.", flush=True)
+                try:
+                    fresh = await extract_with_retry_single(track.url)
+                    fresh.requester = track.requester
+                    track = fresh
+                    async with music.lock:
+                        music.now_playing = track
+                    # 다음 루프에서 다시 play
+                    continue
+                except Exception as e:
+                    print("재추출 실패:", repr(e), flush=True)
+                    # 재추출도 실패면 그냥 스킵 처리(다음 곡)
+                    async with music.lock:
+                        music.now_playing = None
+                        touch_command(music)
+                    await upsert_panel(guild, music)
+                    break
 
-        try:
-            vc.play(source, after=after_play)
-            print(f"[재생 시작] {track.title}", flush=True)
+            # ✅ 정상 종료(혹은 즉시 실패지만 재시도 기회 소진) -> 반복/큐 처리
+            async with music.lock:
+                if music.repeat_mode == "all":
+                    music.queue.append(track)
+                elif music.repeat_mode == "one":
+                    music.queue.appendleft(track)
+
+                if not music.queue:
+                    music.now_playing = None
+                    touch_command(music)
+
             await upsert_panel(guild, music)
-        except Exception as e:
-            print("vc.play 에러:", repr(e), flush=True)
-            bot.loop.call_soon_threadsafe(music.next_event.set)
-            continue
-
-        await music.next_event.wait()
-
-        async with music.lock:
-            was_skip = music.skip_flag
-            music.skip_flag = False
-
-            if (not was_skip) and music.repeat_mode == "all":
-                music.queue.append(track)
-            elif (not was_skip) and music.repeat_mode == "one":
-                music.queue.appendleft(track)
-
-            if not music.queue:
-                music.now_playing = None
-                touch_command(music)
-
-        await upsert_panel(guild, music)
+            break
 
 
 # ==============================
@@ -985,19 +879,28 @@ async def play(interaction: discord.Interaction, 제목: str):
     await interaction.response.defer(thinking=True)
 
     try:
+        # ✅ 어떤 경우든: 통화방에 들어가 있어야 사용 가능
         require_user_in_voice(interaction)
+
+        # ✅ 플리 처리중이면 /재생도 막기(잠깐만)
         await require_not_busy(interaction)
+
+        # ✅ 봇 연결 (이미 다른 통화방이면 차단)
         await connect_voice(interaction)
 
         music = get_music(interaction.guild.id)
         touch_command(music)
 
+        # 패널은 명령 친 채팅에 생성/유지
         music.panel_channel_id = interaction.channel_id
         ensure_idle_task(interaction.guild, music)
         await upsert_panel(interaction.guild, music)
 
+        # ✅ 플레이리스트 자동 인식
         if is_youtube_playlist_input(제목):
+            # ✅ 플리 처리 중에는 다른 명령 전부 잠금(퇴장만 예외)
             async with music.busy_lock:
+                # 중복 플리 요청 방지
                 async with music.lock:
                     if music.is_busy:
                         raise Exception(MSG_BUSY)
@@ -1013,6 +916,7 @@ async def play(interaction: discord.Interaction, 제목: str):
 
                     requester_id = interaction.user.id
 
+                    # ✅ 큐에 100곡 제한으로 적재(stream_url=None -> 재생 직전 추출)
                     async with music.lock:
                         for (t, u) in pairs:
                             music.queue.append(
@@ -1023,7 +927,6 @@ async def play(interaction: discord.Interaction, 제목: str):
                                     requester=requester_id,
                                     duration=None,
                                     thumbnail=None,
-                                    http_headers=None,
                                 )
                             )
                         queue_size = len(music.queue)
@@ -1045,6 +948,7 @@ async def play(interaction: discord.Interaction, 제목: str):
                         pass
 
                 except asyncio.CancelledError:
+                    # ✅ 퇴장으로 플리 작업이 즉시 중단된 경우
                     raise
                 finally:
                     async with music.lock:
@@ -1054,6 +958,7 @@ async def play(interaction: discord.Interaction, 제목: str):
 
             return
 
+        # ✅ 단일곡 처리
         track = await extract_with_retry_single(제목)
         track.requester = interaction.user.id
 
@@ -1077,6 +982,7 @@ async def play(interaction: discord.Interaction, 제목: str):
             pass
 
     except asyncio.CancelledError:
+        # ✅ 플리 처리중 퇴장으로 /재생 작업 자체가 끊긴 경우: 추가 응답 없이 종료
         return
     except Exception as e:
         await interaction.followup.send(str(e))
@@ -1214,6 +1120,7 @@ async def leave(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
 
     try:
+        # ✅ 플리 처리 중이어도 퇴장은 허용 + 플리 작업 즉시 중단
         await require_not_busy(interaction, allow_leave=True)
         require_user_in_bot_voice(interaction)
 
