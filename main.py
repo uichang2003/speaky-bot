@@ -31,6 +31,9 @@ EARLY_FAIL_SEC = 4.0
 # ✅ 즉시 실패 시 재추출/재시도 횟수(1회만)
 EARLY_FAIL_RETRY = 1
 
+# ✅ 보이스 연결 타임아웃(초)
+VOICE_CONNECT_TIMEOUT = 20
+
 # ==============================
 # 문구(통일)
 # ==============================
@@ -39,9 +42,10 @@ MSG_BOT_NOT_IN_VOICE = "지금 봇이 통화방에 없어."
 MSG_NEED_SAME_VOICE = "봇이 있는 통화방에 들어와야 쓸 수 있어."
 MSG_DIFF_VOICE_IN_USE = "다른 통화방에서 날 쓰는 중이야."
 MSG_BUSY = "지금 플레이리스트 처리중이야. 잠깐만."
+MSG_VOICE_TIMEOUT = "음성 채널 연결이 시간 초과됐어. 잠시 후 다시 시도해줘."
 
 # ==============================
-# yt-dlp 설정 (✅ 쿠키 미사용)  ← 처음 방식으로 복귀
+# ✅ yt-dlp 설정 (✅ 쿠키 미사용)  ← 처음 방식으로 복귀
 # ==============================
 YTDLP_OPTIONS_SINGLE = {
     "format": "bestaudio/best",
@@ -82,6 +86,40 @@ FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10",
     "options": "-vn -ar 48000 -ac 2",
 }
+
+# ==============================
+# ✅ 공통: 빈 메시지 전송 방지 + 안전 응답
+# ==============================
+def safe_text(e_or_text) -> str:
+    """
+    입력값: Exception 또는 str
+    출력값: 절대 빈 문자열이 아닌 에러 텍스트
+    """
+    if isinstance(e_or_text, Exception):
+        txt = str(e_or_text).strip()
+        if not txt:
+            return f"{type(e_or_text).__name__} 발생"
+        return txt
+    txt = (str(e_or_text) if e_or_text is not None else "").strip()
+    return txt if txt else "알 수 없는 오류가 발생했습니다."
+
+async def safe_reply(interaction: discord.Interaction, content: str, *, ephemeral: bool = False, suppress_embeds: bool = False):
+    """
+    입력값: interaction, content
+    출력값: response 또는 followup로 안전 전송(빈 메시지 방지)
+    """
+    content = safe_text(content)
+
+    # response가 아직 안 됐으면 response로, 이미 됐으면 followup으로
+    if not interaction.response.is_done():
+        await interaction.response.send_message(content, ephemeral=ephemeral, suppress_embeds=suppress_embeds)
+    else:
+        await interaction.followup.send(content, ephemeral=ephemeral, suppress_embeds=suppress_embeds)
+
+async def safe_defer(interaction: discord.Interaction, *, thinking: bool = True):
+    # 중복 defer 방지
+    if not interaction.response.is_done():
+        await interaction.response.defer(thinking=thinking)
 
 # ==============================
 # 데이터 구조
@@ -126,16 +164,13 @@ class GuildMusic:
 
 music_data: Dict[int, GuildMusic] = {}
 
-
 def get_music(guild_id: int) -> GuildMusic:
     if guild_id not in music_data:
         music_data[guild_id] = GuildMusic()
     return music_data[guild_id]
 
-
 def touch_command(music: GuildMusic):
     music.last_command_ts = time.monotonic()
-
 
 def fmt_time(sec: Optional[int]) -> str:
     if sec is None:
@@ -145,14 +180,12 @@ def fmt_time(sec: Optional[int]) -> str:
     h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
-
 def repeat_label(mode: str) -> str:
     if mode == "one":
         return "🔂 한곡"
     if mode == "all":
         return "🔁 전체"
     return "반복OFF"
-
 
 def repeat_button_style(mode: str) -> discord.ButtonStyle:
     if mode == "all":
@@ -161,14 +194,12 @@ def repeat_button_style(mode: str) -> discord.ButtonStyle:
         return discord.ButtonStyle.primary
     return discord.ButtonStyle.secondary
 
-
 def shuffle_queue_inplace(music: GuildMusic):
     import random
     q = list(music.queue)
     random.shuffle(q)
     music.queue.clear()
     music.queue.extend(q)
-
 
 # ==============================
 # ✅ 플레이리스트 자동 인식
@@ -182,7 +213,6 @@ def is_youtube_playlist_input(q: str) -> bool:
     if "youtube.com/watch" in s and "list=" in s:
         return True
     return False
-
 
 def extract_single_track(query: str) -> Track:
     """
@@ -210,7 +240,6 @@ def extract_single_track(query: str) -> Track:
         duration=info.get("duration"),
         thumbnail=info.get("thumbnail"),
     )
-
 
 def extract_playlist_flat(playlist_url: str, limit: int = PLAYLIST_LIMIT) -> List[Tuple[str, str]]:
     """
@@ -241,7 +270,6 @@ def extract_playlist_flat(playlist_url: str, limit: int = PLAYLIST_LIMIT) -> Lis
 
     return out
 
-
 async def extract_with_retry_single(query: str) -> Track:
     last_err: Optional[Exception] = None
     for attempt in range(1, 5):
@@ -253,7 +281,6 @@ async def extract_with_retry_single(query: str) -> Track:
             await asyncio.sleep(min(2 * attempt, 6))
     raise last_err if last_err else Exception("알 수 없는 추출 실패")
 
-
 async def extract_with_retry_playlist_flat(url: str, limit: int) -> List[Tuple[str, str]]:
     last_err: Optional[Exception] = None
     for attempt in range(1, 4):
@@ -264,7 +291,6 @@ async def extract_with_retry_playlist_flat(url: str, limit: int) -> List[Tuple[s
             print(f"[플리] {attempt}차 목록 추출 실패:", repr(e), flush=True)
             await asyncio.sleep(min(2 * attempt, 6))
     raise last_err if last_err else Exception("플레이리스트 목록을 못 가져왔어.")
-
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -281,7 +307,6 @@ def require_user_in_voice(interaction: discord.Interaction) -> discord.VoiceChan
         raise Exception(MSG_NEED_VOICE)
     return interaction.user.voice.channel
 
-
 def require_user_in_bot_voice(interaction: discord.Interaction) -> discord.VoiceClient:
     if not interaction.guild:
         raise Exception("길드(서버)에서만 쓸 수 있어.")
@@ -295,7 +320,6 @@ def require_user_in_bot_voice(interaction: discord.Interaction) -> discord.Voice
         raise Exception(MSG_NEED_SAME_VOICE)
 
     return vc
-
 
 async def require_not_busy(interaction: discord.Interaction, allow_leave: bool = False):
     """
@@ -311,7 +335,6 @@ async def require_not_busy(interaction: discord.Interaction, allow_leave: bool =
     if busy and not allow_leave:
         raise Exception(MSG_BUSY)
 
-
 # ==============================
 # 패널(임베드+버튼) 유틸
 # ==============================
@@ -325,13 +348,11 @@ def _get_status_text(guild: discord.Guild) -> str:
         return "▶️ 재생중"
     return "대기중"
 
-
 def _requester_name(guild: discord.Guild, requester_id: int) -> str:
     if not requester_id:
         return "알 수 없음"
     m = guild.get_member(requester_id)
     return m.display_name if m else "알 수 없음"
-
 
 def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
     status = _get_status_text(guild)
@@ -378,7 +399,6 @@ def build_panel_embed(guild: discord.Guild, music: GuildMusic) -> discord.Embed:
 
     return embed
 
-
 async def fetch_panel_channel(guild: discord.Guild, music: GuildMusic):
     if not music.panel_channel_id:
         return None
@@ -395,7 +415,6 @@ async def fetch_panel_channel(guild: discord.Guild, music: GuildMusic):
     if not hasattr(ch, "fetch_message"):
         return None
     return ch
-
 
 async def delete_panel(guild: discord.Guild, music: GuildMusic):
     if not music.panel_channel_id or not music.panel_message_id:
@@ -417,7 +436,6 @@ async def delete_panel(guild: discord.Guild, music: GuildMusic):
 
     music.panel_channel_id = None
     music.panel_message_id = None
-
 
 async def upsert_panel(guild: discord.Guild, music: GuildMusic):
     ch = await fetch_panel_channel(guild, music)
@@ -445,7 +463,6 @@ async def upsert_panel(guild: discord.Guild, music: GuildMusic):
         music.panel_message_id = None
         await upsert_panel(guild, music)
 
-
 # ==============================
 # 버튼 UI (✅ Persistent)
 # ==============================
@@ -465,7 +482,7 @@ class MusicControlView(discord.ui.View):
 
         vc = interaction.guild.voice_client
         if not vc or not vc.is_connected() or not vc.channel:
-            await interaction.response.send_message(MSG_BOT_NOT_IN_VOICE, ephemeral=True)
+            await safe_reply(interaction, MSG_BOT_NOT_IN_VOICE, ephemeral=True)
             return False
 
         if (
@@ -473,11 +490,11 @@ class MusicControlView(discord.ui.View):
             or not interaction.user.voice
             or not interaction.user.voice.channel
         ):
-            await interaction.response.send_message(MSG_NEED_VOICE, ephemeral=True)
+            await safe_reply(interaction, MSG_NEED_VOICE, ephemeral=True)
             return False
 
         if interaction.user.voice.channel.id != vc.channel.id:
-            await interaction.response.send_message(MSG_NEED_SAME_VOICE, ephemeral=True)
+            await safe_reply(interaction, MSG_NEED_SAME_VOICE, ephemeral=True)
             return False
 
         return True
@@ -487,7 +504,7 @@ class MusicControlView(discord.ui.View):
         try:
             await require_not_busy(interaction)
         except Exception as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await safe_reply(interaction, safe_text(e), ephemeral=True)
             return
 
         music = get_music(interaction.guild.id)
@@ -505,7 +522,7 @@ class MusicControlView(discord.ui.View):
         try:
             await require_not_busy(interaction)
         except Exception as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await safe_reply(interaction, safe_text(e), ephemeral=True)
             return
 
         music = get_music(interaction.guild.id)
@@ -523,7 +540,7 @@ class MusicControlView(discord.ui.View):
         try:
             await require_not_busy(interaction)
         except Exception as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await safe_reply(interaction, safe_text(e), ephemeral=True)
             return
 
         music = get_music(interaction.guild.id)
@@ -541,7 +558,7 @@ class MusicControlView(discord.ui.View):
         try:
             await require_not_busy(interaction)
         except Exception as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await safe_reply(interaction, safe_text(e), ephemeral=True)
             return
 
         music = get_music(interaction.guild.id)
@@ -564,7 +581,7 @@ class MusicControlView(discord.ui.View):
         try:
             await require_not_busy(interaction)
         except Exception as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await safe_reply(interaction, safe_text(e), ephemeral=True)
             return
 
         music = get_music(interaction.guild.id)
@@ -586,7 +603,7 @@ class MusicControlView(discord.ui.View):
         try:
             await require_not_busy(interaction)
         except Exception as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await safe_reply(interaction, safe_text(e), ephemeral=True)
             return
 
         music = get_music(interaction.guild.id)
@@ -594,7 +611,7 @@ class MusicControlView(discord.ui.View):
 
         async with music.lock:
             if not music.queue:
-                await interaction.response.send_message("대기열이 비어있어.", ephemeral=True)
+                await safe_reply(interaction, "대기열이 비어있어.", ephemeral=True)
                 return
 
             items = list(music.queue)[:20]
@@ -604,14 +621,14 @@ class MusicControlView(discord.ui.View):
                 lines.append(f"...그리고 {more}개 더 있어.")
 
         await upsert_panel(interaction.guild, music)
-        await interaction.response.send_message("📃 대기열\n" + "\n".join(lines), ephemeral=True)
+        await safe_reply(interaction, "📃 대기열\n" + "\n".join(lines), ephemeral=True)
 
     @discord.ui.button(label="퇴장", style=discord.ButtonStyle.danger, emoji="🚪", row=1, custom_id="music_leave")
     async def leave_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await require_not_busy(interaction, allow_leave=True)
         except Exception as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
+            await safe_reply(interaction, safe_text(e), ephemeral=True)
             return
 
         music = get_music(interaction.guild.id)
@@ -619,7 +636,6 @@ class MusicControlView(discord.ui.View):
 
         await do_leave(interaction.guild, music)
         await interaction.response.defer()
-
 
 # ==============================
 # 보이스 연결/퇴장 공통
@@ -640,8 +656,11 @@ async def connect_voice(interaction: discord.Interaction) -> discord.VoiceClient
             raise Exception(MSG_DIFF_VOICE_IN_USE)
         return vc
 
-    return await channel.connect()
-
+    # ✅ 여기서 TimeoutError가 자주 나며 str(e)가 빈 경우가 있음
+    try:
+        return await asyncio.wait_for(channel.connect(), timeout=VOICE_CONNECT_TIMEOUT)
+    except asyncio.TimeoutError as e:
+        raise asyncio.TimeoutError(MSG_VOICE_TIMEOUT) from e
 
 async def do_leave(guild: discord.Guild, music: GuildMusic):
     """
@@ -689,7 +708,6 @@ async def do_leave(guild: discord.Guild, music: GuildMusic):
     except Exception:
         pass
 
-
 # ==============================
 # 유휴 감시
 # ==============================
@@ -722,12 +740,10 @@ async def idle_watcher(guild: discord.Guild, music: GuildMusic):
     except asyncio.CancelledError:
         return
 
-
 def ensure_idle_task(guild: discord.Guild, music: GuildMusic):
     if music.idle_task and not music.idle_task.done():
         return
     music.idle_task = asyncio.create_task(idle_watcher(guild, music))
-
 
 # ==============================
 # ✅ 재생 직전 지연 추출
@@ -738,7 +754,6 @@ async def ensure_stream_ready(track: Track) -> Track:
     new = await extract_with_retry_single(track.url)
     new.requester = track.requester
     return new
-
 
 # ==============================
 # 재생 루프 (✅ 즉시 실패 시 1회 재추출 후 재시도)
@@ -847,7 +862,6 @@ async def player_loop(guild: discord.Guild, music: GuildMusic):
             await upsert_panel(guild, music)
             break
 
-
 # ==============================
 # 이벤트
 # ==============================
@@ -869,14 +883,13 @@ async def on_ready():
     except Exception as e:
         bootlog.exception("SYNC_FAIL: %r", e)
 
-
 # ==============================
 # 슬래시 커맨드
 # ==============================
 @bot.tree.command(name="재생", description="유튜브 URL 또는 제목으로 음악 재생(대기열 추가)")
 @app_commands.describe(제목="URL 또는 제목 입력")
 async def play(interaction: discord.Interaction, 제목: str):
-    await interaction.response.defer(thinking=True)
+    await safe_defer(interaction, thinking=True)
 
     try:
         # ✅ 어떤 경우든: 통화방에 들어가 있어야 사용 가능
@@ -985,13 +998,13 @@ async def play(interaction: discord.Interaction, 제목: str):
         # ✅ 플리 처리중 퇴장으로 /재생 작업 자체가 끊긴 경우: 추가 응답 없이 종료
         return
     except Exception as e:
-        await interaction.followup.send(str(e))
-
+        # ✅ 핵심: 빈 메시지 전송 방지 + defer 여부 상관없이 안전 전송
+        await safe_reply(interaction, safe_text(e))
 
 @bot.tree.command(name="우선예약", description="유튜브 URL 또는 제목을 다음 곡(대기열 맨 앞)으로 예약")
 @app_commands.describe(제목="URL 또는 제목 입력")
 async def priority_play(interaction: discord.Interaction, 제목: str):
-    await interaction.response.defer(thinking=True)
+    await safe_defer(interaction, thinking=True)
 
     try:
         require_user_in_voice(interaction)
@@ -1030,12 +1043,11 @@ async def priority_play(interaction: discord.Interaction, 제목: str):
             pass
 
     except Exception as e:
-        await interaction.followup.send(str(e))
-
+        await safe_reply(interaction, safe_text(e))
 
 @bot.tree.command(name="셔플", description="대기열을 1회 섞기(현재 재생중인 곡은 유지)")
 async def shuffle_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+    await safe_defer(interaction, thinking=True)
 
     try:
         await require_not_busy(interaction)
@@ -1053,15 +1065,14 @@ async def shuffle_cmd(interaction: discord.Interaction):
                 ok = True
 
         await upsert_panel(interaction.guild, music)
-        await interaction.followup.send("🔀 대기열을 섞었어." if ok else "대기열이 2개 이상 있어야 섞을 수 있어.")
+        await safe_reply(interaction, "🔀 대기열을 섞었어." if ok else "대기열이 2개 이상 있어야 섞을 수 있어.")
 
     except Exception as e:
-        await interaction.followup.send(str(e))
-
+        await safe_reply(interaction, safe_text(e))
 
 @bot.tree.command(name="반복", description="반복 모드 변경: OFF -> 전체 -> 한곡 -> OFF")
 async def repeat_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+    await safe_defer(interaction, thinking=True)
 
     try:
         await require_not_busy(interaction)
@@ -1081,15 +1092,14 @@ async def repeat_cmd(interaction: discord.Interaction):
             label = repeat_label(music.repeat_mode)
 
         await upsert_panel(interaction.guild, music)
-        await interaction.followup.send(f"{label} 로 바꿨어.")
+        await safe_reply(interaction, f"{label} 로 바꿨어.")
 
     except Exception as e:
-        await interaction.followup.send(str(e))
-
+        await safe_reply(interaction, safe_text(e))
 
 @bot.tree.command(name="스킵", description="현재 곡만 스킵하고 다음 곡 재생")
 async def skip(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+    await safe_defer(interaction, thinking=True)
 
     try:
         await require_not_busy(interaction)
@@ -1100,7 +1110,7 @@ async def skip(interaction: discord.Interaction):
         ensure_idle_task(interaction.guild, music)
 
         if not (vc.is_playing() or vc.is_paused()):
-            await interaction.followup.send("재생중인 음악이 없어.")
+            await safe_reply(interaction, "재생중인 음악이 없어.")
             return
 
         async with music.lock:
@@ -1109,15 +1119,14 @@ async def skip(interaction: discord.Interaction):
 
         vc.stop()
         await upsert_panel(interaction.guild, music)
-        await interaction.followup.send("⏭️ 다음꺼야.")
+        await safe_reply(interaction, "⏭️ 다음꺼야.")
 
     except Exception as e:
-        await interaction.followup.send(str(e))
-
+        await safe_reply(interaction, safe_text(e))
 
 @bot.tree.command(name="퇴장", description="음악 종료 + 대기열 비움 + 봇 퇴장")
 async def leave(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+    await safe_defer(interaction, thinking=True)
 
     try:
         # ✅ 플리 처리 중이어도 퇴장은 허용 + 플리 작업 즉시 중단
@@ -1128,15 +1137,14 @@ async def leave(interaction: discord.Interaction):
         touch_command(music)
 
         await do_leave(interaction.guild, music)
-        await interaction.followup.send("응.")
+        await safe_reply(interaction, "응.")
 
     except Exception as e:
-        await interaction.followup.send(str(e))
-
+        await safe_reply(interaction, safe_text(e))
 
 @bot.tree.command(name="목록", description="현재 예약(대기열)된 노래 목록 확인")
 async def queue_list(interaction: discord.Interaction):
-    await interaction.response.defer(thinking=True)
+    await safe_defer(interaction, thinking=True)
 
     try:
         await require_not_busy(interaction)
@@ -1148,7 +1156,7 @@ async def queue_list(interaction: discord.Interaction):
 
         async with music.lock:
             if not music.queue:
-                await interaction.followup.send("대기열이 비어있어.")
+                await safe_reply(interaction, "대기열이 비어있어.")
                 return
 
             items = list(music.queue)[:20]
@@ -1159,23 +1167,22 @@ async def queue_list(interaction: discord.Interaction):
             msg = "📃 대기열 목록\n" + "\n\n".join(lines)
 
         await upsert_panel(interaction.guild, music)
-        await interaction.followup.send(msg)
+        await safe_reply(interaction, msg)
 
     except Exception as e:
-        await interaction.followup.send(str(e))
-
+        await safe_reply(interaction, safe_text(e))
 
 @bot.tree.command(name="취소", description="대기열에서 특정 번호의 곡을 삭제(예약 취소)")
 @app_commands.describe(번호="목록에서 보이는 번호(1부터)")
 async def queue_remove(interaction: discord.Interaction, 번호: int):
-    await interaction.response.defer(thinking=True)
+    await safe_defer(interaction, thinking=True)
 
     try:
         await require_not_busy(interaction)
         require_user_in_bot_voice(interaction)
 
         if 번호 <= 0:
-            await interaction.followup.send("그 번호는 없어.")
+            await safe_reply(interaction, "그 번호는 없어.")
             return
 
         music = get_music(interaction.guild.id)
@@ -1184,11 +1191,11 @@ async def queue_remove(interaction: discord.Interaction, 번호: int):
 
         async with music.lock:
             if not music.queue:
-                await interaction.followup.send("대기열이 비어있어.")
+                await safe_reply(interaction, "대기열이 비어있어.")
                 return
 
             if 번호 > len(music.queue):
-                await interaction.followup.send("그 번호는 없어.")
+                await safe_reply(interaction, "그 번호는 없어.")
                 return
 
             q_list = list(music.queue)
@@ -1197,11 +1204,10 @@ async def queue_remove(interaction: discord.Interaction, 번호: int):
             music.queue.extend(q_list)
 
         await upsert_panel(interaction.guild, music)
-        await interaction.followup.send(f"✅ 취소됨: **{removed.title}**")
+        await safe_reply(interaction, f"✅ 취소됨: **{removed.title}**")
 
     except Exception as e:
-        await interaction.followup.send(str(e))
-
+        await safe_reply(interaction, safe_text(e))
 
 if __name__ == "__main__":
     TOKEN = os.getenv("TOKEN")
